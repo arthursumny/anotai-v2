@@ -1,0 +1,79 @@
+name: anotai
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: anotai
+      POSTGRES_PASSWORD: anotai
+      POSTGRES_DB: anotai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U anotai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://anotai:anotai@db:5432/anotai
+      SYNC_DATABASE_URL: postgresql+psycopg2://anotai:anotai@db:5432/anotai
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/code/app
+      - ./templates:/code/templates
+      - ./alembic:/code/alembic
+      - /tmp/anotai-audio:/tmp/anotai-audio
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://anotai:anotai@db:5432/anotai
+      SYNC_DATABASE_URL: postgresql+psycopg2://anotai:anotai@db:5432/anotai
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./app:/code/app
+      - ./templates:/code/templates
+      - /tmp/anotai-audio:/tmp/anotai-audio
+    command: ["arq", "app.worker.WorkerSettings"]
+
+volumes:
+  pgdata:
+  redisdata:

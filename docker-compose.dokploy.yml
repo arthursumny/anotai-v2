@@ -1,0 +1,107 @@
+# AnotAI — compose pronto para Dokploy.
+#
+# Como usar:
+#   1) Copie `.env.example` para `.env` no mesmo diretório e preencha as variáveis.
+#   2) Suba este arquivo no Dokploy como docker-compose.
+#   3) A API roda `alembic upgrade head` antes de abrir a porta 8000.
+
+name: anotai
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-anotai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-anotai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-anotai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-anotai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anotai}
+      SYNC_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-anotai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anotai}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      USER_SECRET_ENCRYPTION_KEY: ${USER_SECRET_ENCRYPTION_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      STT_PROVIDER: ${STT_PROVIDER:-openai}
+      DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-America/Sao_Paulo}
+      AUDIO_UPLOAD_DIR: /var/lib/anotai/audio
+    expose:
+      - "8000"
+    volumes:
+      - audio:/var/lib/anotai/audio
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-anotai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anotai}
+      SYNC_DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-anotai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anotai}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      USER_SECRET_ENCRYPTION_KEY: ${USER_SECRET_ENCRYPTION_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      STT_PROVIDER: ${STT_PROVIDER:-openai}
+      DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-America/Sao_Paulo}
+      AUDIO_UPLOAD_DIR: /var/lib/anotai/audio
+    volumes:
+      - audio:/var/lib/anotai/audio
+    command: ["arq", "app.worker.WorkerSettings"]
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+
+volumes:
+  pgdata:
+  redisdata:
+  audio:

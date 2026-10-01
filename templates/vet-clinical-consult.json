@@ -1,0 +1,46 @@
+{
+  "title": "Consulta Clínica Veterinária",
+  "purpose": "Transformar o áudio de uma consulta veterinária em prontuário estruturado do animal para registro e envio à equipe.",
+  "example_output": "Consulta veterinária — Thor\n\nTutor: Carlos\nEspécie: canino\nSintomas: tosse seca há 3 dias\nDiagnóstico: traqueobronquite\nConduta: repouso e xarope",
+  "semantic_trigger": "Use este template quando a transcrição for de uma consulta ou atendimento veterinário contendo nome do animal, nome do tutor, espécie (canino/felino/outro), sintomas, exame físico, diagnóstico ou conduta/prescrição. Não use para banho/tosa, agendamentos ou conversas administrativas.",
+  "output_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["animal_nome", "tutor_nome", "especie", "sintomas"],
+    "properties": {
+      "animal_nome": { "type": "string", "description": "Nome do animal" },
+      "tutor_nome": { "type": "string", "description": "Nome do tutor responsável" },
+      "especie": { "type": "string", "enum": ["canino", "felino", "outro"] },
+      "raca": { "type": ["string", "null"] },
+      "idade": { "type": ["string", "null"], "description": "Idade livre, ex: '3 anos'" },
+      "peso_kg": { "type": ["number", "null"], "minimum": 0 },
+      "sintomas": { "type": "array", "items": { "type": "string" } },
+      "exame_fisico": { "type": ["string", "null"] },
+      "diagnostico": { "type": ["string", "null"] },
+      "conduta": { "type": ["string", "null"], "description": "Prescrição e orientações" },
+      "retorno_em": { "type": ["string", "null"], "format": "date", "description": "Data de retorno YYYY-MM-DD" }
+    }
+  },
+  "actions": [
+    {
+      "type": "telegram",
+      "config": {
+        "bot_token": "${TELEGRAM_BOT_TOKEN}",
+        "chat_id": "${TELEGRAM_CHAT_ID}",
+        "template": "🐾 Consulta AnotAI\nAnimal: {animal_nome} ({especie})\nTutor: {tutor_nome}\nSintomas: {sintomas}\nDx: {diagnostico}\nConduta: {conduta}"
+      }
+    },
+    {
+      "type": "webhook",
+      "config": {
+        "url": "https://example.com/webhooks/prontuario",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer ${WEBHOOK_TOKEN}",
+          "Content-Type": "application/json"
+        }
+      }
+    }
+  ],
+  "is_public": true
+}

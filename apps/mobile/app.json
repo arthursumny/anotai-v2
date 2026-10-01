@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "AnotAI",
+    "slug": "anotai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.anotai.mobile",
+      "permissions": [
+        "RECORD_AUDIO",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.anotai.mobile",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "O AnotAI precisa do microfone para gravar áudios que serão transcritos e automatizados.",
+        "NSBluetoothAlwaysUsageDescription": "O AnotAI usa Bluetooth para conectar à lapela de gravação.",
+        "NSBluetoothPeripheralUsageDescription": "O AnotAI usa Bluetooth para conectar à lapela de gravação."
+      }
+    },
+    "extra": {
+      "apiUrl": "http://192.168.0.10:8000/api/v1"
+    }
+  }
+}
