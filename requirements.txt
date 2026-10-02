@@ -19,3 +19,4 @@ httpx>=0.27                   # webhooks + MCP HTTP
 python-telegram-bot>=21.0     # dispatcher telegram
 jsonschema>=4.22              # validação de output_schema dos templates
 google-auth>=2.35             # verificação oficial de JWT OIDC do Gmail push
+requests>=2.32,<3             # transporte usado por google.auth.transport.requests
