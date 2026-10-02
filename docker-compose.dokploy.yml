@@ -44,6 +44,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - anotai-api
     environment:
       ENV: production
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-anotai}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anotai}
