@@ -98,8 +98,8 @@ services:
     restart: unless-stopped
     depends_on:
       - api
-    ports:
-      - "80:80"
+    expose:
+      - "80"
 
 volumes:
   pgdata:
