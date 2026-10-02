@@ -1,8 +1,7 @@
-"""AnotAI web — Dockerfile multi-stage.
-
-Estágio 1 (build): node + vite produz dist/.
-Estágio 2 (runtime): nginx serve dist/ e faz reverse proxy de /api/* para a API.
-"""
+# AnotAI web — Dockerfile multi-stage.
+#
+# Estágio 1 (build): node + vite produz dist/.
+# Estágio 2 (runtime): nginx serve dist/ e faz reverse proxy de /api/* para a API.
 
 FROM node:20-alpine AS build
 WORKDIR /build
