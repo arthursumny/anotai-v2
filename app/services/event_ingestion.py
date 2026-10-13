@@ -44,7 +44,6 @@ class EventCandidate:
     from_me: bool = False
     is_group: bool = False
     gmail_label_ids: tuple[str, ...] = ()
-    capture_mode: str | None = None
 
 
 async def _existing_event(
@@ -159,11 +158,6 @@ async def ingest(candidate: EventCandidate, session: AsyncSession) -> Normalized
         candidate.conversation_id is None or not candidate.conversation_id.strip()
     ):
         return None
-    if candidate.capture_mode is not None:
-        if source is not EventSource.AUDIO:
-            raise ValueError("capture_mode só é permitido para eventos de áudio")
-        if candidate.capture_mode not in {"intentional", "continuous"}:
-            raise ValueError("capture_mode deve ser intentional ou continuous")
     if not candidate.type or len(candidate.type) > 80:
         raise ValueError("type deve conter de 1 a 80 caracteres")
     if candidate.occurred_at.tzinfo is None or candidate.occurred_at.utcoffset() is None:
@@ -209,7 +203,6 @@ async def ingest(candidate: EventCandidate, session: AsyncSession) -> Normalized
             "is_group": candidate.is_group,
             "timezone": zone,
             "gmail_label_ids": list(candidate.gmail_label_ids) if source is EventSource.GMAIL else [],
-            **({"capture_mode": candidate.capture_mode} if source is EventSource.AUDIO else {}),
         },
         status="accepted",
     )

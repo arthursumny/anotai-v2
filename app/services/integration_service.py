@@ -10,9 +10,14 @@ import hashlib
 import re
 import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.policy import SMTP
+from email.utils import formatdate
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import anyio
+import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -23,13 +28,24 @@ from app.models.action_execution import ActionExecution
 from app.models.action_item import Reminder, Task
 from app.models.integration_connection import IntegrationConnection
 from app.models.user import User
-from app.models.user_secret import UserSecret
 from app.models.workflow import Workflow, WorkflowExecution, WorkflowStep
 from app.models.workspace import Workspace, WorkspaceMembership
-from app.schemas.workflow_action import ActionValidationError, WorkflowActionType
+from app.schemas.template import ActionConfig
+from app.schemas.workflow_action import (
+    ActionValidationError,
+    SendEmailAction,
+    WorkflowActionType,
+)
 from app.services.action_registry import validate_action
-from app.services.dispatcher import build_secret_scope, load_user_secrets
+from app.services.dispatcher import (
+    _call_mcp_tool_server,
+    build_secret_scope,
+    load_user_secrets,
+    resolve_secrets_in_config,
+)
 from app.services.nango_client import NangoClient, NangoClientError
+from app.services.smtp_delivery import deliver_email
+from app.services.template_actions import TemplateActionError, validate_template_origin
 
 
 class IntegrationExecutionError(ValueError):
@@ -60,11 +76,14 @@ class IntegrationService:
         if membership is None or user is None or workspace is None:
             raise IntegrationExecutionError("Action execution fora do escopo do usuário")
 
-        await self._validate_origin(session, execution)
+        template_origin = await self._validate_origin(session, execution)
 
         self._validate_policy(execution.policy_snapshot)
         try:
-            action = validate_action({"type": execution.action_type, **execution.action_input})
+            action = validate_action(
+                {"type": execution.action_type, **execution.action_input},
+                template_authorized=template_origin is not None,
+            )
         except ActionValidationError as exc:
             raise IntegrationExecutionError("Action input inválido") from exc
 
@@ -73,9 +92,27 @@ class IntegrationService:
         if execution.action_type == WorkflowActionType.CREATE_REMINDER.value:
             return await self._create_reminder(session, execution, workspace, action)
         if execution.action_type == WorkflowActionType.SEND_TELEGRAM.value:
+            if template_origin is not None:
+                return await self._send_template_telegram(session, execution, action, template_origin[0])
             return await self._send_telegram(session, execution, action)
         if execution.action_type == WorkflowActionType.CREATE_CALENDAR_EVENT.value:
             return await self._create_calendar_event(session, execution, action)
+        if execution.action_type == WorkflowActionType.SEND_EMAIL.value:
+            return await self._send_email(execution, user, action)
+        if template_origin is not None:
+            configured, note, document = template_origin
+            if execution.action_type == WorkflowActionType.SEND_WEBHOOK.value:
+                return await self._send_webhook(session, execution, action, configured)
+            if execution.action_type == WorkflowActionType.CALL_MCP_TOOL.value:
+                config = {**configured.config, "arguments_mapping": action.arguments}
+                # Provider auth is resolved against the owned server at send time.
+                result = await _call_mcp_tool_server(
+                    config, {
+                        **document.structured_data, "title": note.title,
+                        "body": document.rendered_content, "summary": note.summary,
+                    }, note, session, rendered_arguments=True,
+                )
+                return {"tool": result["tool"]}
         raise IntegrationExecutionError("Tipo de action sem executor nesta lane")
 
     @staticmethod
@@ -93,10 +130,16 @@ class IntegrationService:
             raise IntegrationExecutionError("Action aguarda confirmação do usuário")
 
     @staticmethod
-    async def _validate_origin(session: AsyncSession, execution: ActionExecution) -> None:
+    async def _validate_origin(session: AsyncSession, execution: ActionExecution):
         snapshot = execution.policy_snapshot
         if not isinstance(snapshot, dict):
             raise IntegrationExecutionError("Origem da action ausente")
+
+        if snapshot.get("origin") == "template":
+            try:
+                return await validate_template_origin(session, execution)
+            except TemplateActionError as exc:
+                raise IntegrationExecutionError("Template provenance inválida") from exc
 
         if snapshot.get("standalone") is True:
             if (
@@ -169,6 +212,10 @@ class IntegrationService:
         task = Task(
             workspace_id=execution.workspace_id,
             user_id=execution.user_id,
+            source_note_id=(
+                uuid.UUID(execution.source_id)
+                if execution.policy_snapshot.get("origin") == "template" else None
+            ),
             idempotency_key=key,
             title=action.title,
             summary=action.summary,
@@ -251,6 +298,56 @@ class IntegrationService:
             # Provider exceptions may contain request URLs or other credentials.
             raise IntegrationExecutionError("Falha ao enviar mensagem Telegram") from None
         return {"message_id": int(message.message_id)}
+
+    async def _send_template_telegram(
+        self, session: AsyncSession, execution: ActionExecution, action: Any, configured: ActionConfig,
+    ) -> dict[str, int]:
+        secrets = await load_user_secrets(session, execution.user_id)
+        scope = {**secrets, "TELEGRAM_BOT_TOKEN": settings.TELEGRAM_BOT_TOKEN}
+        config, missing = resolve_secrets_in_config(configured.config, scope)
+        if missing:
+            raise IntegrationExecutionError("Telegram secret não configurado")
+        token = config.get("bot_token") or settings.TELEGRAM_BOT_TOKEN
+        chat_id = config.get("chat_id") or secrets.get("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            raise IntegrationExecutionError("Telegram não configurado para o usuário")
+        message = await Bot(token=token).send_message(chat_id=chat_id, text=action.text)
+        return {"message_id": int(message.message_id)}
+
+    async def _send_webhook(
+        self, session: AsyncSession, execution: ActionExecution, action: Any, configured: ActionConfig,
+    ) -> dict[str, int]:
+        secrets = await load_user_secrets(session, execution.user_id)
+        config, missing = resolve_secrets_in_config(configured.config, secrets)
+        if missing:
+            raise IntegrationExecutionError("Webhook secret não configurado")
+        headers = {**config.get("headers", {}), "Idempotency-Key": execution.idempotency_key}
+        async with httpx.AsyncClient(timeout=settings.WEBHOOK_TIMEOUT_SECONDS) as client:
+            response = await client.request(
+                config.get("method", "POST"), config["url"], headers=headers, json=action.body,
+            )
+            response.raise_for_status()
+        return {"status_code": response.status_code}
+
+    async def _send_email(
+        self, execution: ActionExecution, user: User, action: SendEmailAction,
+    ) -> dict[str, str]:
+        recipient = action.to or user.email
+        SendEmailAction._single_mailbox(recipient)
+        sender = settings.SMTP_FROM_EMAIL
+        if not settings.SMTP_HOST or not sender:
+            raise IntegrationExecutionError("SMTP não configurado")
+        SendEmailAction._single_mailbox(sender)
+        message_id = f"<{self._idempotency_key(execution, 'email').rsplit(':', 1)[-1]}@anotai>"
+        message = EmailMessage(policy=SMTP)
+        message["From"] = sender
+        message["To"] = recipient
+        message["Subject"] = action.subject
+        message["Date"] = formatdate(usegmt=True)
+        message["Message-ID"] = message_id
+        message.set_content(action.body)
+        await anyio.to_thread.run_sync(deliver_email, message, sender, recipient)
+        return {"message_id": message_id}
 
     async def _create_calendar_event(
         self, session: AsyncSession, execution: ActionExecution, action: Any,

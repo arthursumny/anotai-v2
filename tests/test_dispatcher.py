@@ -5,18 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.services.dispatcher as dispatcher
 from app.core.config import settings
 from app.core.user_secret_crypto import encrypt_user_secret
 from app.models.note import Note, NoteStatus
 from app.models.template import Template
 from app.models.user_secret import UserSecret
+from app.services import integration_service
 from app.services.dispatcher import (
-    dispatch_actions,
     load_user_secrets,
     render_template_string,
     resolve_secrets_in_config,
 )
+from tests.automation_helpers import execute_actions, persist_generation
 
 
 class FakeBot:
@@ -44,9 +44,11 @@ def test_render_simple_and_nested():
     assert render_template_string("Peso: {peso}kg", ctx) == "Peso: 12.5kg"
 
 
-def test_render_missing_falls_back_gracefully():
-    assert render_template_string("Dx: {diagnostico}", {}) == "Dx: N/A"
-    assert render_template_string("{a.b.c}", {"a": {"x": 1}}) == "N/A"
+def test_render_missing_fails_explicitly():
+    with pytest.raises(ValueError, match="ausente"):
+        render_template_string("Dx: {diagnostico}", {})
+    with pytest.raises(ValueError, match="ausente"):
+        render_template_string("{a.b.c}", {"a": {"x": 1}})
     assert render_template_string("S: {sintomas}", {"sintomas": ["tosse", "febre"]}) == "S: tosse, febre"
 
 
@@ -82,7 +84,8 @@ def _note_and_template(uid: uuid.UUID, actions: list[dict]) -> tuple[Note, Templ
 
 
 async def test_dispatch_telegram_uses_secret_and_interpolates(monkeypatch, db_session):
-    monkeypatch.setattr(dispatcher, "Bot", FakeBot)
+    monkeypatch.setattr(integration_service, "Bot", FakeBot)
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "bot-token-real")
     uid = uuid.uuid4()
     token_secret = UserSecret(user_id=uid, key="TELEGRAM_BOT_TOKEN", value="")
     chat_secret = UserSecret(user_id=uid, key="TELEGRAM_CHAT_ID", value="")
@@ -93,31 +96,34 @@ async def test_dispatch_telegram_uses_secret_and_interpolates(monkeypatch, db_se
     await db_session.commit()
 
     note, tpl = _note_and_template(uid, [
-        {"type": "telegram", "config": {
+        {"type": "telegram", "enabled": True, "config": {
             "bot_token": "${TELEGRAM_BOT_TOKEN}",
             "chat_id": "${TELEGRAM_CHAT_ID}",
-            "template": "Atendimento de {animal_nome} ({ausente})",
+            "template": "Atendimento de {animal_nome}",
         }}
     ])
-    logs = await dispatch_actions(note, tpl, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "success"
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 1 and logs[0].status == "succeeded"
     assert FakeBot.last_token == "bot-token-real"  # segredo resolvido, não o placeholder
     assert FakeBot.last_sent is not None
     assert "Thor" in FakeBot.last_sent["text"]
-    assert "N/A" in FakeBot.last_sent["text"]  # variável ausente não quebra
-    assert "bot-token-real" not in str(logs[0].payload)  # segredo não vaza no log
+    assert FakeBot.last_sent["text"] == "Atendimento de Thor"
+    assert "bot-token-real" not in str(logs[0].action_input)
 
 
-async def test_dispatch_missing_secret_fails_gracefully(db_session):
+async def test_dispatch_missing_secret_fails_gracefully(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "TELEGRAM_BOT_TOKEN", "")
     uid = uuid.uuid4()
     note, tpl = _note_and_template(uid, [
-        {"type": "telegram", "config": {"bot_token": "${TELEGRAM_BOT_TOKEN}", "chat_id": "1"}},
-        {"type": "fax", "config": {}},
+        {"type": "telegram", "enabled": True, "config": {"bot_token": "${TELEGRAM_BOT_TOKEN}", "chat_id": "1"}},
+        {"type": "fax", "enabled": True, "config": {}},
     ])
-    logs = await dispatch_actions(note, tpl, db_session)  # nunca levanta
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
     assert len(logs) == 2
-    assert all(lg.status.value == "failed" for lg in logs)
-    assert "Segredo ${TELEGRAM_BOT_TOKEN} não configurado pelo usuário" in (logs[0].error_message or "")
+    assert [row.status for row in logs] == ["pending", "failed"]
+    assert logs[0].last_error == "integrationexecutionerror"
 
 
 async def test_copied_secret_ciphertext_cannot_be_read_by_another_user(db_session):

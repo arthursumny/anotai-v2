@@ -178,9 +178,7 @@ export default function RecordScreen({ navigation }: Props): JSX.Element {
             <>
               {pollState === "done" && (
                 <Text style={styles.done}>
-                  {note.status === "processed"
-                    ? "Nota processada com sucesso"
-                    : "Sem template automático — você pode classificar manualmente"}
+                  {note.template_id ? "Documento salvo" : "Nota geral salva"}
                 </Text>
               )}
               {(note.raw_transcription || "").trim() !== "" ? (

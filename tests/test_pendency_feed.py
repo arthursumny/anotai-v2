@@ -17,10 +17,11 @@ from app.models.workspace import WorkspaceMembership
 async def _audio_note(session, user, *, cards=None, reminder_at=None):
     note = Note(
         user_id=user.id,
-        title="Suggested note",
+        title="Audio note",
+        body="Audio note body written by the capture flow",
         raw_transcription="PRIVATE TRANSCRIPTION SHOULD NOT LEAK",
         structured_data={"kanban_task_ids": cards} if cards is not None else {},
-        status=NoteStatus.SUGGESTED,
+        status=NoteStatus.PROCESSED,
         reminder_at=reminder_at,
     )
     session.add(note)
@@ -76,9 +77,9 @@ async def test_feed_returns_mixed_safe_workspace_items(client, auth_headers, db_
     assert response.status_code == 200, response.text
     body = response.json()
     assert {item["kind"] for item in body["items"]} == {
-        "note_suggestion", "task", "reminder", "follow_up", "action", "approval",
+        "task", "reminder", "follow_up", "action", "approval",
     }
-    assert body["total"] == 7
+    assert body["total"] == 6
     payload = response.text
     for private in ("PRIVATE TRANSCRIPTION", "PRIVATE EVENT CONTENT", "DO NOT RETURN"):
         assert private not in payload

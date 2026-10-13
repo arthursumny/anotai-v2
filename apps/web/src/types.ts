@@ -1,6 +1,6 @@
 /** Tipos espelhando o backend AnotAI. */
 
-export type NoteStatus = "pending_review" | "processed" | "no_match" | "suggested" | "discarded";
+export type NoteStatus = "pending_review" | "processed" | "discarded";
 export type KanbanStatus = "todo" | "in_progress" | "done";
 export type ExecutionStatus = "success" | "failed";
 
@@ -14,8 +14,8 @@ export interface User {
 export interface TemplateAction {
   type: string;
   config: Record<string, unknown>;
-  /** Ações legadas podem não ter o campo: ausente = comportamento antigo (ativa). */
-  enabled?: boolean;
+  enabled: boolean;
+  require_confirmation?: boolean;
 }
 
 export interface Template {
@@ -35,20 +35,6 @@ export interface Template {
   created_at: string;
 }
 
-export type CaptureMode = "intentional" | "continuous";
-
-/** Regra forte de roteamento: decide quando a gravação segue direto para o template. */
-export interface RoutingRule {
-  id: string;
-  template_id: string;
-  context: string | null;
-  capture_mode: CaptureMode | null;
-  priority: number;
-  enabled: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface ExecutionLog {
   id: string;
   note_id: string;
@@ -64,15 +50,14 @@ export interface Note {
   user_id: string;
   template_id: string | null;
   title: string;
+  body: string;
+  summary: string;
   raw_transcription: string;
   structured_data: Record<string, unknown> | null;
   status: NoteStatus;
-  kanban_status: string | null;
   due_date: string | null;
   reminder_at: string | null;
   reminder_sent: boolean;
-  capture_mode: string;
-  suggested_action: string | null;
   created_at: string;
   logs: ExecutionLog[];
 }
@@ -108,10 +93,23 @@ export interface MCPProvider {
   beta: boolean;
 }
 
+export interface TaskRead {
+  id: string;
+  title: string;
+  summary: string;
+  status: string;
+  kanban_status: KanbanStatus;
+  due_at: string | null;
+  remind_at: string | null;
+  source_note_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface KanbanBoard {
-  todo: Note[];
-  in_progress: Note[];
-  done: Note[];
+  todo: TaskRead[];
+  in_progress: TaskRead[];
+  done: TaskRead[];
 }
 
 export interface DraftField {
@@ -248,7 +246,7 @@ export interface LocalizationSettings {
 /* ------------------------------------------------ feed de pendências */
 
 export type PendencyKind =
-  | "note_suggestion" | "task" | "reminder" | "follow_up" | "action" | "approval";
+  | "task" | "reminder" | "follow_up" | "action" | "approval";
 
 export interface PendencyItem {
   id: string;

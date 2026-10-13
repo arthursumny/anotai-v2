@@ -1,11 +1,11 @@
 # AnotAI — Wearable Audio Ingestion & Autonomous Automation Platform
 
-Esqueleto funcional do backend: FastAPI + SQLModel + Postgres + Redis/ARQ + OpenAI (Whisper + GPT Structured Outputs) + JWT (PyJWT + bcrypt).
+Esqueleto funcional do backend: FastAPI + SQLModel + Postgres + Redis/ARQ + Soniox (STT) + OpenAI (roteador e geração de documentos) + JWT (PyJWT + bcrypt).
 
 ## Subir tudo
 
 ```bash
-cp .env.example .env   # preencha OPENAI_API_KEY e JWT_SECRET_KEY
+cp .env.example .env   # preencha SONIOX_API_KEY, OPENAI_API_KEY e JWT_SECRET_KEY
 docker compose up --build
 # API: http://localhost:8000/docs  | health: GET /health
 ```
@@ -23,12 +23,18 @@ Importa `templates/*.json` como templates públicos (`user_id=NULL`).
 ## Fluxo
 
 1. `POST /api/v1/auth/register` → `POST /api/v1/auth/login` (Bearer JWT)
-2. `POST /api/v1/audio/process` (multipart `file`) → `202 {note_id, job_id}`
-3. Worker: STT → router (match/threshold) → extractor (JSON Schema) → dispatcher (telegram/webhook/mcp_tool)
-4. Poll: `GET /api/v1/notes/{id}` (nota + `logs`)
-5. Sem match → `status=no_match` (caixa de entrada, sem ações externas)
+2. `POST /api/v1/audio/process` (multipart `file`; só gravações intencionais) → `202 {note_id, job_id}`
+3. Worker: STT Soniox → roteador OpenAI escolhe **um** dos seus modelos (ou
+   explicitamente nenhum, abaixo de `ROUTER_CONFIDENCE_THRESHOLD`) → documento
+   Markdown seguindo `example_output` + `output_schema` do modelo, processando a
+   transcrição em blocos (`OPENAI_TRANSCRIPT_CHUNK_CHARS`) → nota salva →
+   automações do modelo via ledger durável de ações (email/tarefa/telegram/
+   webhook/mcp)
+4. Poll: `GET /api/v1/notes/{id}` (nota + `logs`, o `ExecutionLog` da nota)
+5. Sem modelo adequado → a LLM gera uma nota contextual estruturada; a nota
+   fica `processed` com `template_id` null (sem ações do modelo)
 6. Reclassificação manual: `POST /api/v1/notes/{id}/reclassify` com `{ "template_id": "uuid" }`
-   (aceita template próprio ou público; roda extração + dispatcher e volta `processed`)
+   (aceita template próprio; regenera o documento e volta `processed`)
 
 ## Templates (incl. "Construir com IA")
 
@@ -52,14 +58,16 @@ Importa `templates/*.json` como templates públicos (`user_id=NULL`).
 - Segredos (`GET|POST /api/v1/secrets`, `DELETE /api/v1/secrets/{key}`) — tokens
   por usuário (`TELEGRAM_BOT_TOKEN`, `WEBHOOK_AUTH_TOKEN`…) usados pelo dispatcher
   via `${CHAVE}` (listagem sempre mascarada). Mensagens suportam `{campo}` e
-  `{objeto.subcampo}` do `structured_data` (+ `note_id`, `created_at`); variável
-  ausente vira `N/A`, segredo ausente falha só aquela ação.
+  `{objeto.subcampo}` do `structured_data` (+ `note_id`, `created_at`); **variável
+  ausente nunca vira `N/A`** — a ação é gravada como `failed` com
+  `last_error=missing_template_variable` e as ações irmãs daquele modelo seguem
+  sendo preparadas. Segredo ausente falha apenas aquela ação, na execução.
 
 ## Testes
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # sqlite em memória, sem docker; 15 testes (API + dispatcher)
+pytest            # sqlite em memória, sem docker; API, pipeline e ações
 ```
 
 ## Ferramentas externas via MCP
@@ -85,32 +93,50 @@ também aceita `${SECRETO}` (ex: `https://mcp.exemplo.com/${TENANT}/mcp`).
   servidor ao OpenAI Tool Calling e executa a escolha da LLM. Timeouts, erros
   JSON-RPC/`isError` e segredo ausente viram log `failed` sem quebrar as demais ações.
 
-## Gravação contínua, inbox e Kanban
+## Gravação intencional, pipeline e Tarefas
 
-- Ingestão: `POST /api/v1/audio/process` aceita `capture_mode=intentional|continuous`.
-  Contínuo roda o extrator Always-On e cria uma `Note` (`suggested`) por item
-  acionável; ruído não gera nada.
-- Triagem: `GET /api/v1/inbox/suggested`, `POST /api/v1/inbox/{id}/accept`
-  (vira `processed` + entra no Kanban, `reminder_at` agenda alerta) e
-  `POST /api/v1/inbox/{id}/discard`.
-- Kanban: `GET /api/v1/kanban` (colunas `todo|in_progress|done`),
-  `PATCH /api/v1/kanban/{id}/move`, `PATCH /api/v1/notes/{id}` (corrige JSON,
-  prazos e coluna).
+- Ingestão: `POST /api/v1/audio/process` aceita **apenas gravações intencionais**
+  (qualquer outro modo de captura → 400). Não existe captura contínua
+  nem triagem de sugestões.
+- Pipeline do worker: **Soniox** transcreve (único STT de produção;
+  `STT_PROVIDER=soniox`, `fake` só em dev/test) → o roteador OpenAI escolhe
+  **um** dos seus modelos ou nenhum (confidence < `ROUTER_CONFIDENCE_THRESHOLD`,
+  padrão 0.6) → o gerador produz um documento Markdown legível seguindo
+  `example_output` + `output_schema` do modelo, processando a transcrição
+  **inteira** em blocos de `OPENAI_TRANSCRIPT_CHUNK_CHARS` (padrão 24000) para
+  nada se perder → nota salva (`processed`) → as automações habilitadas do
+  modelo rodam pelo ledger durável de ações (idempotente, com lease):
+  `SEND_EMAIL`, `CREATE_TASK`, `SEND_TELEGRAM`, `SEND_WEBHOOK`, `CALL_MCP_TOOL`.
+- Sem modelo adequado: a LLM gera uma **nota contextual estruturada** (nunca a
+  transcrição bruta, nunca mock); a nota fica `processed` com `template_id`
+  null e não dispara ações de modelo.
+- Revisão: `GET /api/v1/pendencies` (rota web `/inbox`, nav "Revisar") lista
+  pendências `task` / `reminder` / `follow_up` / `action` / `approval`, com
+  aceitar/ignorar/adar/editar por tipo.
+- Tarefas/quadro: `GET /api/v1/kanban` (colunas `todo|in_progress|done`),
+  `PATCH /api/v1/kanban/{id}/move`; notas criam tarefas via
+  `POST /api/v1/notes/{id}/to-kanban` e `POST /api/v1/notes/{id}/tasks-to-kanban`.
+  O quadro é das **tarefas**: `PATCH /api/v1/notes/{id}` não aceita
+  `kanban_status` — o campo saiu de `NoteUpdate` (que é `extra="forbid"`), então
+  enviá-lo volta 422 de validação de schema. Notas não guardam estado de quadro.
 - Lembretes: cron ARQ `check_scheduled_reminders` a cada 2 min dispara Telegram
-  (`⏰ Lembrete AnotAI…`) quando `reminder_at` chega, sem reenvio.
+  (`Lembrete Anotaí…`) quando `reminder_at` chega, sem reenvio.
 
 ## Dev local sem Docker (opcional)
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-export STT_PROVIDER=fake  # evita custo OpenAI no STT
+export STT_PROVIDER=fake  # STT fake exclusivo de dev/test (evita chamada ao Soniox)
 uvicorn app.main:app --reload
 ```
 
 ## Variáveis-chave
 
-`DATABASE_URL`, `SYNC_DATABASE_URL`, `REDIS_URL`, `OPENAI_API_KEY`, `JWT_SECRET_KEY`,
-`STT_PROVIDER=openai|fake`, `ROUTER_CONFIDENCE_THRESHOLD=0.6`, `MAX_AUDIO_MB`, `AUDIO_UPLOAD_DIR`.
+`DATABASE_URL`, `SYNC_DATABASE_URL`, `REDIS_URL`, `OPENAI_API_KEY`, `SONIOX_API_KEY`, `JWT_SECRET_KEY`,
+`STT_PROVIDER=soniox|fake` (fake só em `ENV=dev|test`), `OPENAI_ROUTER_MODEL=gpt-4o-mini`,
+`OPENAI_EXTRACTOR_MODEL=gpt-4o`, `OPENAI_TRANSCRIPT_CHUNK_CHARS=24000`,
+`ROUTER_CONFIDENCE_THRESHOLD=0.6`, `MAX_AUDIO_MB`, `AUDIO_UPLOAD_DIR`,
+`SMTP_*` (host/porta/credenciais para a automação de email).
 `ffmpeg` já vem no Dockerfile para Opus/WAV do BLE.
 
 ## App mobile
@@ -121,7 +147,8 @@ ajuste `extra.apiUrl` com o IP LAN do backend e rode `npm install && npx expo st
 ## Cliente web (computador)
 
 SPA em `apps/web/` (Vite + React + TS): gravação pelo microfone do PC,
-notas, inbox, Kanban, marketplace, MCP e segredos. Ver `apps/web/README.md`:
+notas, pendências (Revisar), tarefas/quadro, marketplace, MCP/conexões e
+segredos. Ver `apps/web/README.md`:
 
 ```bash
 cd apps/web && npm install && npm run dev   # http://localhost:5173

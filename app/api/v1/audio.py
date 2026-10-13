@@ -1,10 +1,10 @@
 """AnotAI — ingestão de áudio: upload -> Note pending -> job ARQ (202 Accepted)."""
 
-import asyncio
+import anyio
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
@@ -35,16 +35,9 @@ _SUFFIX_BY_CONTENT_TYPE = {
 @router.post("/process", response_model=AudioProcessAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def process_audio(
     file: UploadFile = File(...),
-    capture_mode: str = Form("intentional"),
     session: AsyncSession = Depends(get_session),
     current: User = Depends(get_current_user),
 ) -> AudioProcessAccepted:
-    mode = (capture_mode or "").strip().lower()
-    if mode not in ("intentional", "continuous"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="capture_mode deve ser 'intentional' ou 'continuous'",
-        )
     content_type = (file.content_type or "").split(";")[0].strip().lower()
     if content_type not in settings.allowed_audio_types_set:
         raise HTTPException(
@@ -77,19 +70,18 @@ async def process_audio(
     finally:
         await file.close()
 
-    # Barreira de audibilidade: silêncio/mudo nem cria nota nem gasta Whisper.
-    audible, reason = await asyncio.to_thread(check_audible, tmp_path)
+    audible, reason = await anyio.to_thread.run_sync(check_audible, tmp_path)
     if not audible:
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Sem som aproveitável: {reason}")
 
-    note = Note(user_id=current.id, raw_transcription="", structured_data=None, status=NoteStatus.PENDING_REVIEW, capture_mode=mode)
+    note = Note(user_id=current.id, raw_transcription="", structured_data=None, status=NoteStatus.PENDING_REVIEW)
     session.add(note)
     await session.commit()
     await session.refresh(note)
 
     try:
-        job_id = await enqueue_audio_job(str(note.id), str(tmp_path), str(current.id), mode)
+        job_id = await enqueue_audio_job(str(note.id), str(tmp_path), str(current.id))
     except RuntimeError as exc:
         # Sem job não há nota: apaga o placeholder em vez de órfão pendente.
         await session.delete(note)

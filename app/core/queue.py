@@ -20,12 +20,12 @@ def redis_settings() -> RedisSettings:
     )
 
 
-async def enqueue_audio_job(note_id: str, audio_path: str, user_id: str, capture_mode: str = "intentional") -> str:
+async def enqueue_audio_job(note_id: str, audio_path: str, user_id: str) -> str:
     """Enfileira `process_audio_job` e retorna o job_id. Levanta RuntimeError se o Redis falhar."""
     try:
         pool: ArqRedis = await arq.create_pool(redis_settings())
         try:
-            job = await pool.enqueue_job("process_audio_job", note_id, audio_path, user_id, capture_mode)
+            job = await pool.enqueue_job("process_audio_job", note_id, audio_path, user_id)
             return str(job.job_id)
         finally:
             await pool.close()

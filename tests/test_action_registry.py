@@ -39,7 +39,8 @@ def test_registry_returns_typed_actions_and_parses_aware_local_datetime():
     assert reminder_offset is not None and reminder_offset.total_seconds() == 19800
     assert isinstance(telegram, SendTelegramAction)
     assert set(ACTION_REGISTRY) == {
-        "CREATE_TASK", "CREATE_REMINDER", "SEND_TELEGRAM", "CREATE_CALENDAR_EVENT", "PIPELINE_TRIGGER"
+        "CREATE_TASK", "CREATE_REMINDER", "SEND_TELEGRAM", "CREATE_CALENDAR_EVENT", "PIPELINE_TRIGGER",
+        "SEND_EMAIL", "SEND_WEBHOOK", "CALL_MCP_TOOL",
     }
 
 

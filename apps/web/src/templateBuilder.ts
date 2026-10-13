@@ -19,7 +19,7 @@ export interface ArgRow {
 
 export interface ActionDef {
   uid: number;
-  kind: "telegram" | "webhook" | "mcp";
+  kind: "telegram" | "webhook" | "mcp" | "email" | "create_task";
   chatId: string;
   message: string;
   url: string;
@@ -29,12 +29,16 @@ export interface ActionDef {
   toolName: string;
   dynamic: boolean;
   args: ArgRow[];
-  /**
-   * undefined = ação legada sem o campo no JSON. Preservamos ausente no
-   * roundtrip para não transformar "sem enabled" em disabled nem reescrever
-   * templates antigos com enabled:true à toa.
-   */
-  enabled: boolean | undefined;
+  enabled: boolean;
+  requireConfirmation: boolean;
+  recipient: string;
+  subject: string;
+  body: string;
+  taskTitle: string;
+  taskSummary: string;
+  dueAt: string;
+  configJson: string;
+  config: Record<string, unknown>;
 }
 
 export const KINDS: FieldKind[] = ["texto", "número", "data", "lista", "sim/não", "opções"];
@@ -44,7 +48,7 @@ export const newAction = (kind: ActionDef["kind"]): ActionDef => ({
   uid: uidCounter++,
   kind,
   chatId: "",
-  message: "",
+  message: "{summary}",
   url: "",
   method: "POST",
   authSecret: "",
@@ -56,6 +60,15 @@ export const newAction = (kind: ActionDef["kind"]): ActionDef => ({
   args: [{ k: "", v: "" }],
   // Ação criada pelo usuário no construtor é sempre intencional: nasce ativa.
   enabled: true,
+  requireConfirmation: false,
+  recipient: "",
+  subject: "{title}",
+  body: "{summary}",
+  taskTitle: "{title}",
+  taskSummary: "{summary}",
+  dueAt: "",
+  configJson: "{}",
+  config: {},
 });
 
 /* ------------------------------------------------- conversão: schema JSON */
@@ -163,28 +176,46 @@ export function actionsToDefs(actions: unknown): { defs: ActionDef[]; extra: unk
     const a = raw as Record<string, unknown>;
     const cfg = (a.config as Record<string, unknown> | undefined) ?? {};
     const str = (v: unknown): string => (typeof v === "string" ? v : "");
-    const knownEnabled = typeof a.enabled === "boolean" ? a.enabled : undefined;
+    const knownEnabled = a.enabled === true;
+    const prepare = (kind: ActionDef["kind"]) => ({
+      ...newAction(kind), enabled: knownEnabled,
+      requireConfirmation: a.require_confirmation === true, config: cfg,
+    });
     if (a.type === "telegram") {
-      const d = newAction("telegram");
-      d.enabled = knownEnabled;
+      const d = prepare("telegram");
       const chat = str(cfg.chat_id);
-      d.chatId = chat.includes("${") ? "" : chat;
-      d.message = str(cfg.template ?? cfg.message);
+      d.chatId = chat;
+      d.message = str(cfg.message ?? cfg.template ?? "{summary}");
       defs.push(d);
     } else if (a.type === "webhook") {
-      const d = newAction("webhook");
-      d.enabled = knownEnabled;
+      const d = prepare("webhook");
       d.url = str(cfg.url);
       d.method = str(cfg.method || "POST");
       const headers = (cfg.headers as Record<string, unknown> | undefined) ?? {};
       const auth = str(headers.Authorization ?? headers.authorization);
       const m = auth.match(/^Bearer \$\{(.+)\}$/);
       if (m) d.authSecret = m[1];
+      const { url: _url, method: _method, ...advanced } = cfg;
+      d.configJson = JSON.stringify(advanced, null, 2);
+      defs.push(d);
+    } else if (a.type === "email") {
+      const d = prepare("email");
+      d.recipient = str(cfg.to);
+      d.subject = str(cfg.subject ?? "{title}");
+      d.body = str(cfg.body ?? "{summary}");
+      defs.push(d);
+    } else if (a.type === "create_task") {
+      const d = prepare("create_task");
+      d.taskTitle = str(cfg.title ?? "{title}");
+      d.taskSummary = str(cfg.summary ?? "{summary}");
+      d.dueAt = str(cfg.due_at);
+      defs.push(d);
+    } else if (a.type === "mcp_tool") {
+      const d = prepare("mcp");
+      d.configJson = JSON.stringify(cfg, null, 2);
       defs.push(d);
     } else {
-      // mcp_tool (legado) e tipos desconhecidos: NÃO viram def editável — o objeto
-      // inteiro volta intacto para o JSON no save (roundtrip byte-equivalente),
-      // sem ativar/desativar nem apagar silenciosamente.
+      // Exibidas no editor; salvar exige remoção explícita, nunca roundtrip silencioso.
       extra.push(raw);
     }
   }
@@ -192,37 +223,51 @@ export function actionsToDefs(actions: unknown): { defs: ActionDef[]; extra: unk
 }
 
 export function defsToActions(defs: ActionDef[], extra: unknown[]): unknown[] {
-  const out: unknown[] = [...extra];
+  if (extra.length > 0) throw new Error("Remova as ações não suportadas antes de salvar.");
+  const out: unknown[] = [];
+  const parseConfig = (text: string): Record<string, unknown> => {
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("A configuração da ação deve ser um objeto JSON.");
+    }
+    return value as Record<string, unknown>;
+  };
   for (const d of defs) {
     let action: Record<string, unknown>;
     if (d.kind === "telegram") {
       action = {
         type: "telegram",
-        config: { chat_id: d.chatId.trim(), template: d.message },
+        config: {
+          ...d.config,
+          ...(d.chatId.trim() ? { chat_id: d.chatId.trim() } : { chat_id: null }),
+          template: d.message, message: null,
+        },
       };
     } else if (d.kind === "webhook") {
-      const config: Record<string, unknown> = { url: d.url.trim(), method: d.method };
+      const config: Record<string, unknown> = { ...parseConfig(d.configJson), url: d.url.trim(), method: d.method };
       if (d.authSecret.trim()) {
-        config.headers = { Authorization: `Bearer \${${d.authSecret.trim()}}` };
+        const headers = config.headers;
+        config.headers = {
+          ...(typeof headers === "object" && headers !== null ? headers : {}),
+          Authorization: `Bearer \${${d.authSecret.trim()}}`,
+        };
       }
       action = { type: "webhook", config };
+    } else if (d.kind === "email") {
+      action = { type: "email", config: {
+        subject: d.subject, body: d.body,
+        ...(d.recipient.trim() ? { to: d.recipient.trim() } : {}),
+      } };
+    } else if (d.kind === "create_task") {
+      action = { type: "create_task", config: {
+        title: d.taskTitle, summary: d.taskSummary,
+        ...(d.dueAt.trim() ? { due_at: d.dueAt.trim() } : {}),
+      } };
     } else {
-      const config: Record<string, unknown> = { server_id: d.serverId };
-      if (d.dynamic) {
-        config.dynamic_llm_call = true;
-      } else {
-        config.tool_name = d.toolName.trim();
-        const mapping: Record<string, unknown> = {};
-        for (const row of d.args) {
-          if (row.k.trim()) mapping[row.k.trim()] = row.v;
-        }
-        config.arguments_mapping = mapping;
-      }
-      action = { type: "mcp_tool", config };
+      action = { type: "mcp_tool", config: parseConfig(d.configJson) };
     }
-    // enabled só entra no JSON se veio do template ou o usuário mexeu —
-    // ações legadas sem o campo continuam sem ele (não viram disabled).
-    if (d.enabled !== undefined) action.enabled = d.enabled;
+    action.enabled = d.enabled;
+    action.require_confirmation = d.requireConfirmation;
     out.push(action);
   }
   return out;

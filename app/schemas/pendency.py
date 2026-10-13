@@ -8,7 +8,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 PendencyKind = Literal[
-    "note_suggestion", "task", "reminder", "follow_up", "action", "approval",
+    "task", "reminder", "follow_up", "action", "approval",
 ]
 PendencySubkind = Literal["suggestion", "active"]
 

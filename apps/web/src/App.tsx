@@ -54,18 +54,19 @@ function AppShell() {
       if (checking) return;
       checking = true;
       try {
-        const { listNotes } = await import("./api");
-        const notes = await listNotes();
+        const { getBoard } = await import("./api");
+        const board = await getBoard();
+        const tasks = [...board.todo, ...board.in_progress];
         if (!active) return;
         const now = Date.now();
-        for (const note of notes) {
-          if (!note.reminder_at || note.reminder_sent || note.kanban_status === "done" || new Date(note.reminder_at).getTime() > now) continue;
-          const key = `anotai_reminder_seen:${note.id}:${note.reminder_at}`;
+        for (const task of tasks) {
+          if (!task.remind_at || new Date(task.remind_at).getTime() > now) continue;
+          const key = `anotai_reminder_seen:${task.id}:${task.remind_at}`;
           if (localStorage.getItem(key)) continue;
           localStorage.setItem(key, "1");
           new Notification("Lembrete do Anotaí", {
-            body: note.title || "Você tem um compromisso ou tarefa chegando.",
-            tag: note.id,
+            body: task.title || "Você tem um compromisso ou tarefa chegando.",
+            tag: task.id,
           });
         }
       } catch {

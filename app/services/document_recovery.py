@@ -1,4 +1,4 @@
-"""Bounded recovery scan for intentional audio documents lost on worker crashes."""
+"""Bounded recovery scan for audio documents lost on worker crashes."""
 
 import uuid
 from typing import Any
@@ -13,16 +13,11 @@ from app.models.note import Note, NoteStatus
 from app.models.user import User
 from app.models.workspace import WorkspaceMembership
 from app.services.document_pipeline import process_generated_note
-from app.services.workflow_engine import emit_trigger
+from app.services.workflow_engine import prepare_template_actions
 
 
 async def reconcile_missing_documents(session: AsyncSession, limit: int = 100) -> dict[str, int]:
-    """Recover up to ``limit`` eligible notes using bounded keyset pages.
-
-    Only intentional audio events carrying explicit capture-mode metadata are
-    considered. Legacy and continuous events stay opted out of recovery.
-    Content and exception details are never logged by this service.
-    """
+    """Recover persisted documents without regenerating content or inline sends."""
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise ValueError("limit deve ser um inteiro positivo")
     has_document = select(GeneratedDocument.id).where(
@@ -36,7 +31,6 @@ async def reconcile_missing_documents(session: AsyncSession, limit: int = 100) -
         statement = select(NormalizedEvent).where(
             NormalizedEvent.source == "audio",
             NormalizedEvent.type == "AUDIO_TRANSCRIBED",
-            NormalizedEvent.metadata_json["capture_mode"].as_string() == "intentional",
             not_(has_document),
         ).order_by(NormalizedEvent.id.asc()).limit(limit)
         if cursor is not None:
@@ -89,14 +83,7 @@ async def reconcile_missing_documents(session: AsyncSession, limit: int = 100) -
                 # failures can be retried independently without losing it.
                 await session.commit()
                 try:
-                    await emit_trigger(
-                        session,
-                        document.workspace_id,
-                        document.user_id,
-                        "DOCUMENT_GENERATED",
-                        source_id=document.id,
-                        context={"source": "audio", "event_type": "DOCUMENT_GENERATED"},
-                    )
+                    await prepare_template_actions(session, note, user.id)
                     await session.commit()
                 except Exception:
                     await session.rollback()

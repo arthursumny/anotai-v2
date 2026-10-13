@@ -136,7 +136,7 @@ code { padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; back
 }
 .badge.processed { color: #17674c; background: #e6f5ed; border-color: #c8e7d4; }
 .badge.general { color: #52665a; background: #eef2ef; border-color: #dfe6e0; }
-.badge.no_match, .badge.suggested { color: #805719; background: #fbf3de; border-color: #efdfad; }
+.badge.warning { color: #805719; background: #fbf3de; border-color: #efdfad; }
 .badge.pending_review, .badge.discarded { color: #68766f; background: #f0f3f1; border-color: #e0e7e2; }
 .kv { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; overflow-wrap: anywhere; }
 .kv b { color: var(--ink-dim); font-weight: 650; }

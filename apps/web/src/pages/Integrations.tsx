@@ -1007,7 +1007,7 @@ export default function Integrations() {
                     <>
                       <div className="row" style={{ justifyContent: "space-between" }}>
                         <b>Acompanhamento configurado — aguardando sincronização</b>
-                        <span className="badge no_match">não garante e-mails chegando ainda</span>
+                        <span className="badge warning">não garante e-mails chegando ainda</span>
                       </div>
                       <p className="muted" style={{ margin: "8px 0 0" }}>
                         {policySummary(policy)} A preparação acontece em segundo plano; assim que os e-mails

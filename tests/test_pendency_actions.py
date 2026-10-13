@@ -18,9 +18,10 @@ async def _audio_source(db_session, user, *, cards=None, reminder_at=None):
     note = Note(
         user_id=user.id,
         title="Audio note",
+        body="Audio note body written by the capture flow",
         raw_transcription="SENSITIVE RAW TRANSCRIPTION",
         structured_data={"kanban_task_ids": cards} if cards is not None else {},
-        status=NoteStatus.SUGGESTED,
+        status=NoteStatus.PROCESSED,
         reminder_at=reminder_at,
     )
     db_session.add(note)
@@ -55,12 +56,12 @@ async def _followup_suggestion(db_session, user, *, direction="incoming", conver
     return event, suggestion
 
 
-async def test_task_accept_twice_creates_one_safe_kanban_card(client, auth_headers, db_session):
+async def test_task_accept_twice_preserves_native_task_and_source(client, auth_headers, db_session):
     headers, user_id = auth_headers
     user = await db_session.get(User, uuid.UUID(user_id))
     source_note, event = await _audio_source(db_session, user)
     task = Task(
-        workspace_id=user.workspace_id, user_id=user.id, source_event_id=event.id,
+        workspace_id=user.workspace_id, user_id=user.id, source_event_id=event.id, source_note_id=source_note.id,
         idempotency_key="accept-task", title="Suggested task", status="suggested",
     )
     db_session.add(task)
@@ -71,16 +72,16 @@ async def test_task_accept_twice_creates_one_safe_kanban_card(client, auth_heade
     second = await client.post(url, headers=headers, json={"title": "Changed on retry"})
 
     assert first.status_code == second.status_code == 200
-    assert first.json() == second.json() == {"kind": "task", "id": str(task.id), "status": "consumed"}
-    notes = (await db_session.exec(select(Note).where(
-        Note.user_id == user.id, Note.structured_data["origin_task_id"].as_string() == str(task.id),
-    ))).all()
+    assert first.json() == second.json() == {"kind": "task", "id": str(task.id), "status": "open"}
+    await db_session.refresh(task)
+    assert task.title == "Accepted title"
+    assert task.status == "open" and task.kanban_status == "todo"
+    assert task.source_note_id == source_note.id and task.source_event_id == event.id
+    tasks = (await db_session.exec(select(Task).where(Task.user_id == user.id))).all()
+    assert [row.id for row in tasks] == [task.id]
+    notes = (await db_session.exec(select(Note).where(Note.user_id == user.id))).all()
     assert len(notes) == 1
-    assert notes[0].title == "Accepted title"
-    assert notes[0].status == NoteStatus.PROCESSED
-    assert notes[0].kanban_status == "todo"
-    assert notes[0].structured_data == {"origin_task_id": str(task.id)}
-    assert notes[0].raw_transcription == ""
+    assert notes[0].id == source_note.id
     assert source_note.raw_transcription == "SENSITIVE RAW TRANSCRIPTION"
 
 
@@ -171,7 +172,7 @@ async def test_accept_is_scoped_and_naive_remind_at_rejected(client, auth_header
     assert foreign.status == own_reminder.status == "suggested"
 
 
-async def test_direct_task_accept_rejects_existing_kanban_card(client, auth_headers, db_session):
+async def test_direct_task_accept_ignores_legacy_source_card_metadata(client, auth_headers, db_session):
     headers, user_id = auth_headers
     user = await db_session.get(User, uuid.UUID(user_id))
     _, event = await _audio_source(db_session, user, cards=["existing-card"])
@@ -184,31 +185,37 @@ async def test_direct_task_accept_rejects_existing_kanban_card(client, auth_head
 
     response = await client.post(f"/api/v1/pendencies/task/{task.id}/accept", headers=headers)
     await db_session.refresh(task)
-    assert response.status_code == 409
-    assert task.status == "superseded"
+    assert response.status_code == 200
+    assert task.status == "open" and task.kanban_status == "todo"
     notes = (await db_session.exec(select(Note).where(Note.user_id == user.id))).all()
     assert len(notes) == 1
 
 
-async def test_ignore_is_idempotent_and_legacy_note_route_works(client, auth_headers, db_session):
+async def test_ignore_is_idempotent_and_rejects_non_suggested_task(client, auth_headers, db_session):
     headers, user_id = auth_headers
     user = await db_session.get(User, uuid.UUID(user_id))
     task = Task(
         workspace_id=user.workspace_id, user_id=user.id, idempotency_key="ignore-task",
         title="Ignore me", status="suggested",
     )
-    note = Note(user_id=user.id, title="Legacy suggestion", status=NoteStatus.SUGGESTED)
-    db_session.add_all([task, note])
+    accepted = Task(
+        workspace_id=user.workspace_id, user_id=user.id, idempotency_key="ignore-accepted",
+        title="Already accepted", status="open",
+    )
+    db_session.add_all([task, accepted])
     await db_session.commit()
 
     first = await client.post(f"/api/v1/pendencies/task/{task.id}/ignore", headers=headers)
     second = await client.post(f"/api/v1/pendencies/task/{task.id}/ignore", headers=headers)
-    legacy = await client.post(f"/api/v1/pendencies/note_suggestion/{note.id}/ignore", headers=headers)
+    no_longer_suggested = await client.post(
+        f"/api/v1/pendencies/task/{accepted.id}/ignore", headers=headers,
+    )
 
-    assert first.status_code == second.status_code == legacy.status_code == 200
+    assert first.status_code == second.status_code == 200
     assert first.json() == second.json() == {"kind": "task", "id": str(task.id), "status": "dismissed"}
-    await db_session.refresh(note)
-    assert note.status == NoteStatus.DISCARDED
+    assert no_longer_suggested.status_code == 409
+    await db_session.refresh(task)
+    assert task.status == "dismissed"
 
 
 async def test_snooze_hides_item_until_expiry_and_rejects_past_or_naive(client, auth_headers, db_session):
@@ -241,15 +248,19 @@ async def test_snooze_hides_item_until_expiry_and_rejects_past_or_naive(client, 
     assert all(item["id"] != str(action.id) for item in feed.json()["items"])
 
 
-async def test_edit_updates_task_and_legacy_note_before_acceptance(client, auth_headers, db_session):
+async def test_edit_updates_task_and_reminder_before_acceptance(client, auth_headers, db_session):
     headers, user_id = auth_headers
     user = await db_session.get(User, uuid.UUID(user_id))
     task = Task(
         workspace_id=user.workspace_id, user_id=user.id, idempotency_key="edit-task",
         title="Original", status="suggested",
     )
-    note = Note(user_id=user.id, title="Old note", status=NoteStatus.SUGGESTED)
-    db_session.add_all([task, note])
+    reminder = Reminder(
+        workspace_id=user.workspace_id, user_id=user.id, idempotency_key="edit-reminder",
+        title="Reminder original", status="suggested",
+        remind_at=datetime.now(timezone.utc) + timedelta(days=2),
+    )
+    db_session.add_all([task, reminder])
     await db_session.commit()
     due_at = datetime.now(timezone.utc) + timedelta(days=4)
 
@@ -257,22 +268,29 @@ async def test_edit_updates_task_and_legacy_note_before_acceptance(client, auth_
         f"/api/v1/pendencies/task/{task.id}/edit", headers=headers,
         json={"title": "Updated title", "due_at": due_at.isoformat()},
     )
-    note_edit = await client.patch(
-        f"/api/v1/pendencies/note_suggestion/{note.id}/edit", headers=headers,
-        json={"title": "Updated legacy"},
+    reminder_edited = await client.patch(
+        f"/api/v1/pendencies/reminder/{reminder.id}/edit", headers=headers,
+        json={"title": "Updated reminder"},
     )
     feed = await client.get("/api/v1/pendencies", headers=headers)
     await db_session.refresh(task)
-    await db_session.refresh(note)
+    await db_session.refresh(reminder)
 
-    assert edited.status_code == note_edit.status_code == 200
+    assert edited.status_code == reminder_edited.status_code == 200
     assert task.title == "Updated title"
     assert task.due_at.replace(tzinfo=timezone.utc) == due_at
-    assert note.title == "Updated legacy"
+    assert reminder.title == "Updated reminder"
     items = {item["id"]: item for item in feed.json()["items"]}
     assert items[str(task.id)]["title"] == "Updated title"
     assert items[str(task.id)]["due_at"] is not None
-    assert items[str(note.id)]["title"] == "Updated legacy"
+    assert items[str(reminder.id)]["title"] == "Updated reminder"
+
+    accepted = await client.post(f"/api/v1/pendencies/task/{task.id}/accept", headers=headers)
+    edited_after_accept = await client.patch(
+        f"/api/v1/pendencies/task/{task.id}/edit", headers=headers, json={"title": "Too late"},
+    )
+    assert accepted.status_code == 200
+    assert edited_after_accept.status_code == 409
 
 
 async def test_approval_ignore_points_to_workflow_dismiss(client, auth_headers, db_session):
@@ -448,27 +466,74 @@ async def test_followup_resolve_marks_answered_and_due_followup_can_be_snoozed(
     assert snoozable.snoozed_until is not None
 
 
-async def test_legacy_note_suggestion_accepts_once_in_place(client, auth_headers, db_session):
+async def test_audio_sourced_task_accepts_once_with_due_at_and_keeps_source_note(
+    client, auth_headers, db_session,
+):
+    """An audio-sourced task pendency is accepted once and stays a native Task."""
     headers, user_id = auth_headers
     user = await db_session.get(User, uuid.UUID(user_id))
-    note = Note(
-        user_id=user.id, title="Legacy note", raw_transcription="private transcript",
-        status=NoteStatus.SUGGESTED,
+    source_note, event = await _audio_source(db_session, user)
+    task = Task(
+        workspace_id=user.workspace_id, user_id=user.id,
+        source_event_id=event.id, source_note_id=source_note.id,
+        idempotency_key="audio-task", title="From audio", summary="Safe summary",
+        status="suggested",
     )
-    db_session.add(note)
+    db_session.add(task)
     await db_session.commit()
-    target = datetime.now(timezone.utc) + timedelta(days=1)
-    url = f"/api/v1/pendencies/note_suggestion/{note.id}/accept"
+    target = datetime(2030, 1, 2, 9, tzinfo=timezone.utc)
+    url = f"/api/v1/pendencies/task/{task.id}/accept"
     first = await client.post(url, headers=headers, json={"due_at": target.isoformat()})
     second = await client.post(url, headers=headers, json={"due_at": target.isoformat()})
 
-    await db_session.refresh(note)
+    await db_session.refresh(task)
     assert first.status_code == second.status_code == 200
-    assert first.json() == second.json() == {
-        "kind": "note_suggestion", "id": str(note.id), "status": "processed",
-    }
-    assert note.status == NoteStatus.PROCESSED and note.kanban_status == "todo"
-    assert note.raw_transcription == "private transcript"
+    assert first.json() == second.json() == {"kind": "task", "id": str(task.id), "status": "open"}
+    assert task.status == "open" and task.kanban_status == "todo"
+    assert task.due_at.replace(tzinfo=timezone.utc) == target
+    assert task.source_note_id == source_note.id and task.source_event_id == event.id
+    tasks = (await db_session.exec(select(Task).where(Task.user_id == user.id))).all()
+    assert [row.id for row in tasks] == [task.id]
+    notes = (await db_session.exec(select(Note).where(Note.user_id == user.id))).all()
+    assert [note.id for note in notes] == [source_note.id]
+    assert source_note.status == NoteStatus.PROCESSED
+    assert source_note.raw_transcription == "SENSITIVE RAW TRANSCRIPTION"
+    assert source_note.structured_data == {}
+
+
+async def test_note_suggestion_kind_is_rejected_as_unsupported(client, auth_headers, db_session):
+    """The retired triage-inbox kind must never silently come back (422 on every verb)."""
+    headers, user_id = auth_headers
+    user = await db_session.get(User, uuid.UUID(user_id))
+    note = Note(
+        user_id=user.id, title="Retired suggestion", body="Audio note body",
+        status=NoteStatus.PROCESSED,
+    )
+    db_session.add(note)
+    await db_session.commit()
+    note_id = note.id
+    target = datetime.now(timezone.utc) + timedelta(days=1)
+
+    accept = await client.post(
+        f"/api/v1/pendencies/note_suggestion/{note_id}/accept", headers=headers, json={},
+    )
+    ignore = await client.post(
+        f"/api/v1/pendencies/note_suggestion/{note_id}/ignore", headers=headers,
+    )
+    snooze = await client.post(
+        f"/api/v1/pendencies/note_suggestion/{note_id}/snooze", headers=headers,
+        json={"until": target.isoformat()},
+    )
+    edit = await client.patch(
+        f"/api/v1/pendencies/note_suggestion/{note_id}/edit", headers=headers,
+        json={"title": "Nope"},
+    )
+
+    assert [r.status_code for r in (accept, ignore, snooze, edit)] == [422, 422, 422, 422]
+    for response in (accept, ignore, snooze, edit):
+        assert response.json()["detail"] == "Unsupported pendency kind"
+    await db_session.refresh(note)
+    assert note.status == NoteStatus.PROCESSED
 
 
 async def test_followup_suggestion_is_dismissed_snoozed_and_edited_as_suggestion(client, auth_headers, db_session):

@@ -19,8 +19,8 @@ import type { Note } from "../types";
 type Props = NativeStackScreenProps<NotesStackParamList, "NotesList">;
 
 function preview(n: Note): string {
-  const base = n.title?.trim() || n.raw_transcription || "";
-  if (!base) return "Áudio em processamento…";
+  const base = n.title.trim() || n.summary;
+  if (!base) return n.status === "pending_review" ? "Geração pendente" : "Nota sem título";
   return base.length > 120 ? `${base.slice(0, 120)}…` : base;
 }
 

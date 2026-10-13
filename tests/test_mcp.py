@@ -8,14 +8,19 @@ import pytest
 
 from app.core.config import settings
 from app.core.user_secret_crypto import encrypt_user_secret
-import app.services.dispatcher as dispatcher
-import app.services.mcp_client as mcp_client
 from app.models.mcp_server import UserMCPServer
 from app.models.note import Note, NoteStatus
 from app.models.template import Template
 from app.models.user_secret import UserSecret
-from app.services.dispatcher import dispatch_actions
-from app.services.mcp_client import MCPError, call_tool, list_tools, resolve_mcp_auth, resolve_server_url
+from app.services import dispatcher, mcp_client
+from app.services.mcp_client import (
+    MCPError,
+    call_tool,
+    list_tools,
+    resolve_mcp_auth,
+    resolve_server_url,
+)
+from tests.automation_helpers import execute_actions, persist_generation
 
 
 # ---------------------------------------------------------------- fakes ---
@@ -195,7 +200,7 @@ def _note_tpl(uid: uuid.UUID, actions: list[dict]):
     )
     tpl = Template(
         user_id=uid, title="Vet", semantic_trigger="x",
-        output_schema={"type": "object"}, actions=actions, is_public=False,
+        output_schema={"type": "object"}, actions=[{"enabled": True, **action} for action in actions], is_public=False,
     )
     return note, tpl
 
@@ -242,14 +247,14 @@ async def test_dispatch_mcp_static_mapping_with_secret(fake_http, db_session):
             "arguments_mapping": {"title": "{animal_nome} - Retorno", "date": "{retorno_em}"},
         },
     }])
-    logs = await dispatch_actions(note, tpl, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "success"
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 1 and logs[0].status == "succeeded"
     # segredo resolvido no header, interpolação nos argumentos
     assert captured["headers"].get("Authorization") == "tok-agenda-1"
     assert captured["payload"]["params"]["arguments"] == {"title": "Thor - Retorno", "date": "2026-10-01"}
-    result = logs[0].payload["result"]
-    assert result["server"] == "Agenda" and result["tool"] == "create_event"
-    assert "tok-agenda-1" not in str(logs[0].payload)  # segredo não vaza no log
+    assert captured["payload"]["params"]["name"] == "create_event"
+    assert "tok-agenda-1" not in str(logs[0].action_input)
 
 
 async def test_dispatch_mcp_missing_secret_fails_gracefully(db_session):
@@ -259,9 +264,10 @@ async def test_dispatch_mcp_missing_secret_fails_gracefully(db_session):
         {"type": "mcp_tool", "config": {"server_id": str(server.id), "tool_name": "create_event"}},
         {"type": "fax", "config": {}},
     ])
-    logs = await dispatch_actions(note, tpl, db_session)  # nunca levanta
-    assert len(logs) == 2 and all(lg.status.value == "failed" for lg in logs)
-    assert "Segredo ${AGENDA_TOKEN} não configurado pelo usuário" in (logs[0].error_message or "")
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 2 and [row.status for row in logs] == ["pending", "failed"]
+    assert logs[0].last_error == "runtimeerror"
 
 
 async def test_dispatch_mcp_url_with_secret_placeholder(fake_http, db_session):
@@ -291,8 +297,9 @@ async def test_dispatch_mcp_url_with_secret_placeholder(fake_http, db_session):
         "type": "mcp_tool",
         "config": {"server_id": str(server.id), "tool_name": "create_event", "arguments_mapping": {}},
     }])
-    logs = await dispatch_actions(note, tpl, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "success", logs[0].error_message
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 1 and logs[0].status == "succeeded", logs[0].last_error
     assert captured["url"] == "https://mcp.exemplo.com/acme/mcp"
 
 
@@ -307,9 +314,10 @@ async def test_dispatch_mcp_url_missing_secret_fails(db_session):
         "type": "mcp_tool",
         "config": {"server_id": str(server.id), "tool_name": "create_event"},
     }])
-    logs = await dispatch_actions(note, tpl, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "failed"
-    assert "Segredo ${TENANT} não configurado pelo usuário" in (logs[0].error_message or "")
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 1 and logs[0].status == "pending"
+    assert logs[0].last_error == "runtimeerror"
 
 
 async def test_dispatch_mcp_dynamic_llm_call(fake_http, db_session, monkeypatch):
@@ -331,7 +339,10 @@ async def test_dispatch_mcp_dynamic_llm_call(fake_http, db_session, monkeypatch)
         async def create(self, **kwargs):
             calls["openai_tools"] = kwargs.get("tools")
             fn = SimpleNamespace(name="create_event", arguments='{"title": "Thor - Retorno"}')
-            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=fn)]))])
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(refusal=None, tool_calls=[SimpleNamespace(function=fn)]),
+            )])
 
     class FakeOpenAI:
         def __init__(self, api_key=None):
@@ -345,13 +356,14 @@ async def test_dispatch_mcp_dynamic_llm_call(fake_http, db_session, monkeypatch)
         "type": "mcp_tool",
         "config": {"server_id": str(server.id), "dynamic_llm_call": True},
     }])
-    logs = await dispatch_actions(note, tpl, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "success", logs[0].error_message
+    await persist_generation(db_session, note, tpl)
+    logs = await execute_actions(db_session, note)
+    assert len(logs) == 1 and logs[0].status == "succeeded", logs[0].last_error
     # LLM recebeu as tools do servidor e a escolha dela foi executada
     assert calls["openai_tools"][0]["function"]["name"] == "create_event"
     assert calls["call"]["params"]["name"] == "create_event"
     assert calls["call"]["params"]["arguments"] == {"title": "Thor - Retorno"}
-    assert logs[0].payload["result"]["via"] == "dynamic_llm_call"
+    assert logs[0].attempts == 1
 
 
 # ------------------------------------------------------------- endpoints ---

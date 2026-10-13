@@ -9,7 +9,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.models.action_execution import ActionExecution
 from app.models.action_item import ActionSuggestion, FollowUp, Reminder, Task
 from app.models.normalized_event import NormalizedEvent
-from app.models.note import Note, NoteStatus
+from app.models.note import Note
 from app.models.user import User
 from app.models.workspace import WorkspaceMembership
 from app.schemas.pendency import PendencyRead
@@ -45,23 +45,6 @@ async def get_pendency_feed(
 
     now = datetime.now(timezone.utc)
     items: list[PendencyRead] = []
-    notes = (await session.exec(
-        select(Note).where(
-            Note.user_id == user.id,
-            Note.status == NoteStatus.SUGGESTED,
-        )
-    )).all()
-    for note in notes:
-        if _not_snoozed(note.snoozed_until, now):
-            items.append(PendencyRead(
-                id=note.id,
-                kind="note_suggestion",
-                title=note.title or "Note suggestion",
-                summary=None,
-                created_at=note.created_at,
-                due_at=note.due_date,
-                source="audio",
-            ))
 
     tasks = (await session.exec(select(Task).where(
         Task.workspace_id == workspace_id,

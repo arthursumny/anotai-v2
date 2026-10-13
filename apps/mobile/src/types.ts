@@ -1,8 +1,8 @@
 /** AnotAI mobile — tipos espelhando o backend (Pydantic v2). */
 
-export type NoteStatus = "pending_review" | "processed" | "no_match";
+export type NoteStatus = "pending_review" | "processed" | "discarded";
 export type ExecutionStatus = "success" | "failed";
-export type ActionType = "telegram" | "whatsapp" | "webhook" | "mcp_tool" | "email" | string;
+export type ActionType = "telegram" | "webhook" | "mcp_tool" | "email" | "create_task";
 
 export interface User {
   id: string;
@@ -19,6 +19,8 @@ export interface AuthToken {
 export interface TemplateAction {
   type: ActionType;
   config: Record<string, unknown>;
+  enabled: boolean;
+  require_confirmation?: boolean;
 }
 
 export interface Template {
@@ -49,15 +51,14 @@ export interface Note {
   user_id: string;
   template_id: string | null;
   title: string;
+  body: string;
+  summary: string;
   raw_transcription: string;
   structured_data: Record<string, unknown> | null;
   status: NoteStatus;
-  kanban_status: string | null;
   due_date: string | null;
   reminder_at: string | null;
   reminder_sent: boolean;
-  capture_mode: string;
-  suggested_action: string | null;
   created_at: string;
   logs: ExecutionLog[];
 }
@@ -77,11 +78,36 @@ export interface Secret {
 }
 
 export interface NotePatch {
+  body?: string;
+  summary?: string;
   raw_transcription?: string;
   structured_data?: Record<string, unknown> | null;
   template_id?: string | null;
   title?: string;
-  kanban_status?: string | null;
   due_date?: string | null;
   reminder_at?: string | null;
+}
+
+export interface TaskRead {
+  id: string;
+  title: string;
+  summary: string;
+  status: string;
+  kanban_status: "todo" | "in_progress" | "done";
+  due_at: string | null;
+  remind_at: string | null;
+  source_note_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ActionExecution {
+  id: string;
+  trigger_type: string;
+  action_type: string;
+  status: string;
+  attempts: number;
+  created_at: string;
+  last_error: string | null;
+  source_id: string | null;
 }

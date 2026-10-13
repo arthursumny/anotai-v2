@@ -8,7 +8,7 @@ import {
   listTemplates,
   updateTemplate,
 } from "../api";
-import type { RoutingRule, Template } from "../types";
+import type { Template } from "../types";
 
 import type { ActionDef, FieldDef, FieldKind } from "../templateBuilder";
 import {
@@ -29,32 +29,6 @@ const EMPTY_META = { category: "", useCases: "", routingDescription: "" };
 
 const parseUseCases = (raw: string): string[] =>
   raw.split("\n").map((s) => s.trim()).filter(Boolean).slice(0, 20);
-
-const EMPTY_RULE_FORM = { priority: "100" };
-
-/**
- * Hoje o pipeline de roteamento só aplica regras GLOBAIS em gravação intencional
- * (context=null; capture_mode='intentional' ou null, que é coringa — e o worker
- * só roteia no modo intencional). Regras com contexto ou modo contínuo criadas
- * por API são preservadas e exibidas, mas não executam — a UI não deve prometer
- * o contrário.
- */
-const ruleSupported = (r: RoutingRule): boolean =>
-  r.context === null && (r.capture_mode === "intentional" || r.capture_mode === null);
-
-/** Resumo legível da regra forte, com alcance explícito (nunca "Sempre"). */
-const ruleSummary = (r: RoutingRule): string => {
-  const base = ruleSupported(r)
-    ? "Para novas gravações intencionais"
-    : r.context && r.capture_mode === "continuous"
-      ? `Contexto “${r.context}” em gravação contínua`
-      : r.context
-        ? `Contexto “${r.context}”`
-        : r.capture_mode === "continuous"
-          ? "Gravação contínua"
-          : "Regra personalizada";
-  return `${base} · prioridade ${r.priority}`;
-};
 
 export default function Templates() {
   const [items, setItems] = useState<Template[]>([]);
@@ -84,12 +58,6 @@ export default function Templates() {
   const [meta, setMeta] = useState(EMPTY_META);
   const [origMeta, setOrigMeta] = useState(EMPTY_META);
   const [editingVersion, setEditingVersion] = useState<number | null>(null);
-  // Regras fortes de roteamento (só existem para template já salvo).
-  const [rules, setRules] = useState<RoutingRule[]>([]);
-  const [rulesLoading, setRulesLoading] = useState(false);
-  const [rulesError, setRulesError] = useState<string | null>(null);
-  const [ruleForm, setRuleForm] = useState(EMPTY_RULE_FORM);
-  const [ruleSaving, setRuleSaving] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -123,9 +91,6 @@ export default function Templates() {
     setMeta(EMPTY_META);
     setOrigMeta(EMPTY_META);
     setEditingVersion(null);
-    setRules([]);
-    setRulesError(null);
-    setRuleForm(EMPTY_RULE_FORM);
   };
 
   /** Exemplo inicial para templates antigos (sem exemplo): esqueleto dos campos. */
@@ -181,6 +146,10 @@ export default function Templates() {
 
   const save = async () => {
     setError(null);
+    if (extraActions.length > 0) {
+      setError("Remova as ações não suportadas antes de salvar esta automação.");
+      return;
+    }
     if (!form.title.trim()) {
       setError("Dê um nome ao template.");
       return;
@@ -197,6 +166,7 @@ export default function Templates() {
       return;
     }
     for (const a of actions) {
+      if (!a.enabled) continue;
       // Telegram da plataforma: destino padrão = chat conectado em Segredos.
       // chatId preenchido = override opcional para outro chat/grupo.
       if (a.kind === "telegram" && !a.message.trim()) {
@@ -244,71 +214,6 @@ export default function Templates() {
     }
   };
 
-  const loadRules = async (templateId: string) => {
-    setRulesLoading(true);
-    setRulesError(null);
-    try {
-      const { listRoutingRules } = await import("../api");
-      setRules(await listRoutingRules(templateId));
-    } catch (e) {
-      const { apiError } = await import("../api");
-      setRulesError(apiError(e));
-      setRules([]);
-    } finally {
-      setRulesLoading(false);
-    }
-  };
-
-  const addRule = async () => {
-    if (!editingId) return;
-    // Enquanto o pipeline só roteia gravações intencionais sem filtro de contexto,
-    // a criação pela UI é sempre regra global intencional.
-    const body: Record<string, unknown> = { capture_mode: "intentional" };
-    const prio = Number.parseInt(ruleForm.priority, 10);
-    if (Number.isFinite(prio)) body.priority = Math.max(0, Math.min(1000, prio));
-    setRuleSaving(true);
-    setRulesError(null);
-    try {
-      const { createRoutingRule } = await import("../api");
-      await createRoutingRule(editingId, body);
-      setRuleForm(EMPTY_RULE_FORM);
-      await loadRules(editingId);
-    } catch (e) {
-      const { apiError } = await import("../api");
-      setRulesError(apiError(e));
-    } finally {
-      setRuleSaving(false);
-    }
-  };
-
-  const toggleRule = async (r: RoutingRule) => {
-    if (!editingId) return;
-    setRulesError(null);
-    // Otimista: reflete na hora e desfaz se a API falhar.
-    setRules((l) => l.map((x) => (x.id === r.id ? { ...x, enabled: !r.enabled } : x)));
-    try {
-      const { updateRoutingRule } = await import("../api");
-      await updateRoutingRule(editingId, r.id, { enabled: !r.enabled });
-    } catch (e) {
-      const { apiError } = await import("../api");
-      setRulesError(apiError(e));
-      setRules((l) => l.map((x) => (x.id === r.id ? { ...x, enabled: r.enabled } : x)));
-    }
-  };
-
-  const removeRule = async (r: RoutingRule) => {
-    if (!editingId) return;
-    setRulesError(null);
-    try {
-      const { deleteRoutingRule } = await import("../api");
-      await deleteRoutingRule(editingId, r.id);
-      setRules((l) => l.filter((x) => x.id !== r.id));
-    } catch (e) {
-      const { apiError } = await import("../api");
-      setRulesError(apiError(e));
-    }
-  };
-
   const edit = (t: Template) => {
     const { defs, extra: xa } = actionsToDefs(t.actions);
     const { fields: legacy } = schemaToFields(t.output_schema);
@@ -337,10 +242,6 @@ export default function Templates() {
     setMeta(loadedMeta);
     setOrigMeta(loadedMeta);
     setEditingVersion(t.version);
-    setRules([]);
-    setRulesError(null);
-    setRuleForm(EMPTY_RULE_FORM);
-    void loadRules(t.id);
     setEditingId(t.id);
     setShowForm(true);
     setError(null);
@@ -360,11 +261,6 @@ export default function Templates() {
   };
 
   const fieldNames = fields.map((f) => f.name.trim()).filter(Boolean);
-
-  /** Ações mcp_tool legadas: não editáveis aqui, preservadas inteiras no save. */
-  const legacyAppActions = extraActions.filter(
-    (x) => typeof x === "object" && x !== null && (x as { type?: unknown }).type === "mcp_tool",
-  ).length;
 
   /** Ações salvas como desativadas (ex: clone do Marketplace) — exibidas na lista. */
   const disabledActions = (t: Template) => (t.actions ?? []).filter((a) => a.enabled === false).length;
@@ -405,9 +301,6 @@ export default function Templates() {
       setMeta(EMPTY_META);
       setOrigMeta(EMPTY_META);
       setEditingVersion(null);
-      setRules([]);
-      setRulesError(null);
-      setRuleForm(EMPTY_RULE_FORM);
       setEditingId(null);
       setAiOpen(false);
       setAiBrief("");
@@ -502,31 +395,70 @@ export default function Templates() {
           </details>
 
           <label style={{ marginTop: 16 }}>O que deve acontecer depois?</label>
-          <p className="muted" style={{ marginTop: 0 }}>As ações que você escolher são executadas automaticamente quando uma gravação combinar com esta automação.</p>
+          <p className="muted" style={{ marginTop: 0 }}>A nota é salva antes das ações. Ative cada ação e escolha se ela precisa de confirmação.</p>
+          <p className="muted">Variáveis: {"{title}"}, {"{body}"}, {"{summary}"} e os campos extraídos do documento.</p>
           {actions.map((a) => (
             <div key={a.uid} className="card" style={{ background: a.enabled === false ? "#f3f4f6" : "#f9fafb" }}>
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <select style={{ width: "auto" }} value={a.kind}
-                  onChange={(e) => patchAction(a.uid, { kind: e.target.value as ActionDef["kind"] })}>
+                  onChange={(e) => setActions((list) => list.map((item) => item.uid === a.uid ? { ...newAction(e.target.value as ActionDef["kind"]), uid: a.uid } : item))}>
+                  <option value="email">Email</option>
+                  <option value="create_task">Criar tarefa</option>
                   <option value="telegram">Enviar no meu Telegram</option>
                   <option value="webhook">Enviar para outro sistema (webhook)</option>
+                  <option value="mcp">Ferramenta MCP</option>
                 </select>
                 <button className="btn-danger"
                   onClick={() => setActions((l) => l.filter((x) => x.uid !== a.uid))}>Remover</button>
               </div>
 
               <label className="row" style={{ gap: 8, marginTop: 8 }}>
-                <input type="checkbox" style={{ width: "auto" }} checked={a.enabled !== false}
+                <input type="checkbox" style={{ width: "auto" }} checked={a.enabled}
                   onChange={(e) => patchAction(a.uid, { enabled: e.target.checked })} />
                 Ação ativada
+              </label>
+              <label className="row" style={{ gap: 8 }}>
+                <input type="checkbox" style={{ width: "auto" }} checked={a.requireConfirmation}
+                  onChange={(e) => patchAction(a.uid, { requireConfirmation: e.target.checked })} />
+                Confirmar antes de executar
               </label>
               {a.enabled === false && (
                 <div className="card" style={{ background: "#fffbeb", border: "1px solid #fde68a", marginTop: 8 }}>
                   <b>Esta ação está desativada.</b>
                   <p className="muted" style={{ margin: "4px 0 0" }}>
-                    Ative-a acima apenas se quiser enviar os dados da nota para outro serviço.
+                    Ative-a acima apenas se quiser executar esta ação.
                   </p>
                 </div>
+              )}
+
+              {a.kind === "email" && (
+                <>
+                  <label>Destinatário (opcional)</label>
+                  <input type="email" value={a.recipient} placeholder="Vazio = email da sua conta"
+                    onChange={(e) => patchAction(a.uid, { recipient: e.target.value })} />
+                  <label>Assunto</label>
+                  <input value={a.subject} onChange={(e) => patchAction(a.uid, { subject: e.target.value })} />
+                  <label>Mensagem</label>
+                  <textarea rows={4} value={a.body} onChange={(e) => patchAction(a.uid, { body: e.target.value })} />
+                </>
+              )}
+              {a.kind === "create_task" && (
+                <>
+                  <label>Título da tarefa</label>
+                  <input value={a.taskTitle} onChange={(e) => patchAction(a.uid, { taskTitle: e.target.value })} />
+                  <label>Resumo</label>
+                  <textarea rows={3} value={a.taskSummary} onChange={(e) => patchAction(a.uid, { taskSummary: e.target.value })} />
+                  <label>Prazo (opcional, ISO com fuso ou variável)</label>
+                  <input value={a.dueAt} placeholder="Ex: {due_at}"
+                    onChange={(e) => patchAction(a.uid, { dueAt: e.target.value })} />
+                </>
+              )}
+              {a.kind === "mcp" && (
+                <>
+                  <label>Configuração MCP (JSON)</label>
+                  <textarea rows={8} value={a.configJson} onChange={(e) => patchAction(a.uid, { configJson: e.target.value })} />
+                  <p className="muted">Use server_id, tool_name, arguments_mapping e dynamic_llm_call. A configuração salva aparece integralmente para edição.</p>
+                </>
               )}
 
               {a.kind === "telegram" && (
@@ -581,7 +513,7 @@ export default function Templates() {
                       <select value={a.method} onChange={(e) => patchAction(a.uid, { method: e.target.value })}>
                         <option>POST</option>
                         <option>PUT</option>
-                        <option>GET</option>
+                        <option>PATCH</option>
                       </select>
                     </div>
                     <div>
@@ -590,6 +522,9 @@ export default function Templates() {
                         onChange={(e) => patchAction(a.uid, { authSecret: e.target.value.toUpperCase() })} />
                     </div>
                   </div>
+                  <label>Headers e corpo personalizados (JSON)</label>
+                  <textarea rows={5} value={a.configJson}
+                    onChange={(e) => patchAction(a.uid, { configJson: e.target.value })} />
                   <p className="muted">O AnotAI envia a nota completa em JSON. Se informar o segredo, ele vai como <code>Bearer</code>.</p>
                 </>
               )}
@@ -597,99 +532,24 @@ export default function Templates() {
             </div>
           ))}
           <div className="row">
+            <button className="btn-secondary" onClick={() => setActions((l) => [...l, newAction("email")])}>＋ Email</button>
+            <button className="btn-secondary" onClick={() => setActions((l) => [...l, newAction("create_task")])}>＋ Criar tarefa</button>
             <button className="btn-secondary" onClick={() => setActions((l) => [...l, newAction("telegram")])}>
               ＋ Telegram
             </button>
             <button className="btn-secondary" onClick={() => setActions((l) => [...l, newAction("webhook")])}>
               ＋ Outro sistema
             </button>
+            <button className="btn-secondary" onClick={() => setActions((l) => [...l, newAction("mcp")])}>＋ MCP</button>
           </div>
-          {legacyAppActions > 0 && (
-            <div className="card" style={{ background: "#f3f4f6", marginTop: 8 }}>
-              <p className="muted" style={{ margin: 0 }}>
-                Esta automação guarda {legacyAppActions === 1
-                  ? "uma configuração antiga de app conectado"
-                  : `${legacyAppActions} configurações antigas de apps conectados`} que não aparece
-                aqui nem pode ser recriada. Ela fica salva exatamente como está — o AnotAI não ativa
-                nem apaga nada por conta própria.
-              </p>
+          {extraActions.map((raw, index) => (
+            <div className="card" key={index}>
+              <b>Ação não suportada</b>
+              <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{JSON.stringify(raw, null, 2)}</pre>
+              <p className="error">Esta ação impede salvar. Remova-a explicitamente ou cancele a edição.</p>
+              <button className="btn-danger" onClick={() => setExtraActions((list) => list.filter((_, i) => i !== index))}>Remover ação não suportada</button>
             </div>
-          )}
-
-          {editingId && (
-            <>
-              <label style={{ marginTop: 16 }}>Quando aplicar sem perguntar (regra forte)</label>
-              <p className="muted" style={{ marginTop: 0 }}>
-                Com uma regra forte, toda nova gravação intencional usa este modelo direto — antes de qualquer
-                análise da IA e sem passar pela sua revisão. É diferente das ações acima: elas acontecem depois
-                que a nota sai pronta — a regra forte escolhe o modelo antes de tudo.
-              </p>
-              {rulesError && <p className="error">{rulesError}</p>}
-              {rulesLoading ? (
-                <p className="muted">Carregando regras…</p>
-              ) : (
-                <>
-                  {rules.length === 0 && (
-                    <p className="muted">Sem regra forte — a IA sugere e você confirma antes de aplicar.</p>
-                  )}
-                  {rules.some(ruleSupported) && (
-                    <p className="muted">
-                      Se mais de uma automação tiver regra forte, vale a de maior prioridade; no empate, a mais antiga primeiro.
-                    </p>
-                  )}
-                  {rules.map((r) => (
-                    <div key={r.id} className="card"
-                      style={{ background: r.enabled && ruleSupported(r) ? "#f9fafb" : "#f3f4f6" }}>
-                      <div className="row" style={{ justifyContent: "space-between" }}>
-                        <span>{ruleSummary(r)}</span>
-                        <div className="row">
-                          {ruleSupported(r) && (
-                            <label className="row" style={{ gap: 8, margin: 0 }}>
-                              <input type="checkbox" style={{ width: "auto" }} checked={r.enabled}
-                                onChange={() => void toggleRule(r)} />
-                              Ativada
-                            </label>
-                          )}
-                          <button className="btn-danger" onClick={() => void removeRule(r)}>Remover</button>
-                        </div>
-                      </div>
-                      {!ruleSupported(r) ? (
-                        <div style={{ marginTop: 6 }}>
-                          <span className="badge pending_review">Não aplicável no fluxo atual</span>
-                          <p className="muted" style={{ margin: "6px 0 0" }}>
-                            Hoje só regras para gravação intencional são aplicadas. Esta regra não será
-                            executada, mas seus detalhes ficam preservados — remova apenas se quiser.
-                          </p>
-                        </div>
-                      ) : !r.enabled ? (
-                        <p className="muted" style={{ margin: "6px 0 0" }}>
-                          Desativada: esta regra não decide nada até você ativá-la de novo.
-                        </p>
-                      ) : null}
-                    </div>
-                  ))}
-                  <details style={{ marginTop: 8 }}>
-                    <summary className="muted" style={{ cursor: "pointer" }}>Adicionar regra forte</summary>
-                    <div style={{ marginTop: 8 }}>
-                      <p className="muted" style={{ margin: "0 0 8px" }}>
-                        Vai valer para todas as suas novas gravações intencionais: elas usam este modelo
-                        direto, antes de qualquer análise da IA e sem passar pela sua revisão.
-                      </p>
-                      <label>Prioridade (maior vence empates com outras regras)</label>
-                      <input type="number" min={0} max={1000} value={ruleForm.priority}
-                        onChange={(e) => setRuleForm((f) => ({ ...f, priority: e.target.value }))} />
-                      <div className="row" style={{ marginTop: 8 }}>
-                        <button className="btn-secondary" disabled={ruleSaving}
-                          onClick={() => void addRule()}>
-                          {ruleSaving ? "Adicionando…" : "Adicionar regra"}
-                        </button>
-                      </div>
-                    </div>
-                  </details>
-                </>
-              )}
-            </>
-          )}
+          ))}
 
           <label className="row" style={{ gap: 8, marginTop: 16 }}>
             <input type="checkbox" style={{ width: "auto" }} checked={form.is_public}

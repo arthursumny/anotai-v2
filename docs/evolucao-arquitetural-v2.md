@@ -2,11 +2,53 @@
 
 > Diagnóstico do código desta cópia, antes da implementação. Evidência de testes: `AUDIO_UPLOAD_DIR=/tmp/opencode/anotai-audio pytest -q -p no:cacheprovider` → **80 aprovados**. Sem esse override, 2 testes de upload falham por permissão em `/tmp/anotai-audio`. Esta cópia não contém `.git`; não é possível criar commits aqui. Não houve inspeção de banco de produção nem integração real com serviços externos.
 
+> **Estado atual (superior ao relato histórico abaixo).** Este documento é um
+> log de evolução: as seções 1–17 e os marcos F1–F6 descrevem o estado do
+> código **na época da auditoria/plano** e foram mantidas como histórico.
+> Mudanças posteriores tornaram os trechos indicados como *(histórico)*
+> obsoletos. Hoje o sistema é:
+>
+> - **Gravação apenas intencional** — `POST /api/v1/audio/process` recusa
+>   qualquer captura que não seja intencional; a captura contínua (always-on)
+>   foi removida.
+> - **STT exclusivamente Soniox** em produção (`STT_PROVIDER=soniox|fake`;
+>   `fake` só em `ENV=dev|test`). Não existe STT via OpenAI/Whisper.
+> - **Seleção de template por LLM** — as regras determinísticas de roteamento
+>   (`app/models/template_routing_rule.py` e o endpoint
+>   `/templates/{id}/routing-rules`) foram removidas; o roteador OpenAI escolhe
+>   um dos modelos do usuário ou explicitamente nenhum, com limiar
+>   `ROUTER_CONFIDENCE_THRESHOLD` (padrão 0.6).
+> - **Sem modelo adequado** a LLM gera uma nota contextual estruturada; a nota
+>   fica `processed` com `template_id` null. Os estados `NoteStatus.SUGGESTED`,
+>   `NoteStatus.NO_MATCH` / `status=no_match` e a pendência `note_suggestion`
+>   não fazem parte do fluxo (o arquivo `app/api/v1/inbox.py` foi removido).
+> - **Caixa de triagem removida** — os endpoints `GET /api/v1/inbox/suggested`,
+>   `POST /api/v1/inbox/{id}/accept` e `POST /api/v1/inbox/{id}/discard` não
+>   existem mais; a revisão acontece na **Action Inbox** `GET /api/v1/pendencies`
+>   (rota web `/inbox`, nav "Revisar"; kinds `task`/`reminder`/`follow_up`/
+>   `action`/`approval`).
+> - **Quadro nativo de Tarefas** — `GET /api/v1/kanban` +
+>   `PATCH /api/v1/kanban/{id}/move`, com notas enviadas ao quadro via
+>   `POST /api/v1/notes/{id}/to-kanban` e `POST /api/v1/notes/{id}/tasks-to-kanban`;
+>   `PATCH /api/v1/notes/{id}` rejeita `kanban_status` (422) — o estado de Kanban
+>   é das tarefas, não das notas.
+>
+> O pipeline de gravação hoje: áudio → Soniox → roteador LLM → documento
+> Markdown em blocos (`OPENAI_TRANSCRIPT_CHUNK_CHARS`, padrão 24000) seguindo
+> `example_output` + `output_schema` → nota salva → automações do template via
+> ledger durável/idempotente/lease (`SEND_EMAIL`, `CREATE_TASK`,
+> `SEND_TELEGRAM`, `SEND_WEBHOOK`, `CALL_MCP_TOOL`). `ExecutionLog` continua
+> sendo o log de erros de pipeline/geração da nota, exposto como `NoteRead.logs`.
+
 ## 1. Arquitetura atual
+
+*(histórico — descreve o estado na época da auditoria; ver "Estado atual" acima.)*
 
 FastAPI/SQLModel + Alembic + PostgreSQL, Redis/ARQ e OpenAI; web React e mobile Expo compartilham API `/api/v1`. Upload de áudio → nota pendente → worker STT → roteamento de templates → extração JSON validada por JSON Schema ou nota geral → persistência → dispatcher de ações. Captura contínua bifurca em sugestões, sem template. Redis/ARQ enfileira áudio e faz cron de lembretes. `app/api/v1/audio.py:35-102`, `app/worker.py:170-416`, `app/services/router.py:49-115`, `app/services/extractor.py:19-64`, `docker-compose.yml:3-75`.
 
 ## 2. Funcionalidades já implementadas
+
+*(histórico — a captura contínua, o inbox de sugestões e o STT OpenAI foram removidos; ver "Estado atual" acima.)*
 
 Áudio intencional/contínuo, STT OpenAI/fake, nota geral resiliente, roteamento LLM com heurística/threshold, extração estruturada, edição/reclassificação/redisparo de notas, Kanban, lembretes associados à nota, inbox para sugestões de captura contínua, autenticação JWT, Telegram e webhook, templates privados/públicos e marketplace de clonagem. `app/worker.py`, `app/services/general_note.py`, `app/api/v1/{notes,inbox,kanban,templates,marketplace}.py`, `app/services/dispatcher.py`. Não existem ainda os conceitos independentes de Task/Reminder/FollowUp/NormalizedEvent/GeneratedDocument/Workflow ou isolamento real por workspace.
 
@@ -63,9 +105,13 @@ Sob `app/models/`, `app/services/`, `app/api/v1/` e `app/schemas/` existentes: e
 
 ## 11. Módulos a alterar
 
+*(histórico — o módulo `inbox` foi removido; a Action Inbox hoje é `/api/v1/pendencies`.)*
+
 `app/worker.py`, `app/services/{router,extractor,dispatcher}.py`, `app/core/{config,queue,deps}.py`, `app/api/v1/{audio,notes,templates,marketplace,inbox,__init__}.py`, modelos/schemas e Alembic. Web: `App.tsx`, `api.ts`, `types.ts`, `templateBuilder.ts`, `pages/{Templates,Mcp,Marketplace,Inbox,NoteDetail}.tsx`; mobile apenas contratos relevantes em `apps/mobile/src/services/api.ts` inicialmente. Preservar captura, notas e marketplace atuais.
 
 ## 12. Integrações atuais
+
+*(histórico — o STT hoje é Soniox (não OpenAI), o email real é via SMTP e há Nango/Gmail/Calendar/Evolution GO implementados; ver "Estado atual" no topo e os runbooks `operacao-integracoes.md` / `operacao-whatsapp-evolution-go.md`.)*
 
 Telegram bot, webhook HTTP e MCP (OAuth para serviços catalogados, servidor arbitrário, tools); OpenAI para STT/LLM. Ações `email` e `whatsapp` no dispatcher são stubs (`app/services/dispatcher.py:348-401`). Não há Nango, conexão Google via Nango, Gmail source, Google Calendar action ou Evolution GO implementados.
 
@@ -104,7 +150,7 @@ Não adotar duas sugestões da revisão porque contrariam requisitos explícitos
 | F2, eventos e notas inteligentes | Source policies + NormalizedEvent/idempotência, regras determinísticas + router/fallback + GeneratedDocument; inteligência classifica Task/Reminder/FollowUp separadamente com confidence | Eventos bloqueados não persistem/chegam ao LLM, escopo workspace, schema, timezone, regressão marketplace; revisão @oracle. |
 | F3, ação confiável | Registry schema/permission, workflow trigger/conditions/actions, executions, ARQ para reminder/follow-up/recovery, Telegram e interno | Idempotência/retries/restart, sem chamada LLM→provider; revisão @oracle. |
 | F4, Nango e Google | Connect UI, IntegrationService, Calendar action, Gmail watch/PubSub/cursor/renovação/filtros | Webhook OIDC, ownership, história paginada/404/retry, testes mocks e smoke com credenciais externas; revisão @oracle. |
-| F5, WhatsApp e pendências | Evolution GO adapter/QR/status, whitelist/blacklist antes da persistência/LLM, fromMe/conversation state/follow-up; Action Inbox web e preferências | Conversa bloqueada jamais alcança storage/LLM, pergunta resolvida cancela follow-up; revisão @oracle e designer para UI. |
+| F5, WhatsApp e pendências | Evolution GO adapter/QR/status, whitelist/blacklist antes da persistência/LLM, fromMe/conversation state/follow-up; Action Inbox web e preferências *(hoje: `GET /api/v1/pendencies`, rota web `/inbox`)* | Conversa bloqueada jamais alcança storage/LLM, pergunta resolvida cancela follow-up; revisão @oracle e designer para UI. |
 | F6, hardening | Auditoria, retenção/exclusão, observabilidade sem PII, DLQ/reconciliação, rate limits e documentação operacional | Testes de segurança/migração/recovery + revisão @oracle; nenhum commit nesta cópia sem `.git`. |
 
 Gates de fase: implementar em lanes sem conflito, validar evidência específica, revisão arquitetural, corrigir achados materiais e avançar. Presets/marketplace de workflows e provedores adicionais ficam como extensões **não-MVP**. Não prometer conexão funcional sem Nango/GCP/Evolution GO configurados.
@@ -119,9 +165,9 @@ Gates de fase: implementar em lanes sem conflito, validar evidência específica
 ## Estado da implementação nesta cópia (pós-auditoria)
 
 - **F1 fechada:** workspace pessoal com membership e backfill; clone de marketplace com ações externas desativadas, contrato `enabled`/consentimento e execução bloqueada para template público de outro dono.
-- **F2 fechada:** eventos normalizados com opt-in por fonte e filtros antes da persistência/LLM; regras fortes + fallback geral preservado; documento versionado separado, classificação estruturada e Task/Reminder/ActionSuggestion sugestivos; áudio ligado à pipeline. Captura contínua não gera GeneratedDocument neste corte.
+- **F2 fechada:** eventos normalizados com opt-in por fonte e filtros antes da persistência/LLM; regras fortes + fallback geral preservado; documento versionado separado, classificação estruturada e Task/Reminder/ActionSuggestion sugestivos; áudio ligado à pipeline. Captura contínua não gera GeneratedDocument neste corte *(histórico: a captura contínua foi removida depois; ver "Estado atual" no topo)*.
 - **F3 fechada:** definições de workflow/etapas, settings por action, execution ledger com claim/lease, schema de ações, confirmação com preview, actions internas/Telegram, scheduler ARQ delayed + reconciliação SQL, recovery de documentos e interface web de fluxos. Uma definição inválida não bloqueia outros workflows/tenants. Telegram externo mantém semântica at-least-once: crash entre envio e commit pode duplicar.
 - **Evidência final F3:** `AUDIO_UPLOAD_DIR=/tmp/opencode/anotai-audio pytest -q -p no:cacheprovider` → **257 testes aprovados**; build web aprovado; migrations F2/F3 e concorrência de claim verificadas em PostgreSQL 16 descartável. Cópia sem `.git`, sem commits. Nenhuma conexão Google/Nango/WhatsApp real foi testada.
 - **F4 fechada para desenvolvimento:** Nango Connect UI/REST e webhook HMAC, Gmail Push Pub/Sub OIDC, history/watch com opt-in e filtro pré-corpo/LLM, renovação/reconciliação, lacuna de histórico com retomada explícita, Calendar action via conexão própria e UI de Integrações sem MCP. **357 testes backend** e build web aprovados; migration testada em PostgreSQL descartável. Uso real depende de configuração externa Nango/Google e smoke de conta teste; ver [runbook](operacao-integracoes.md). MCP legado permanece no backend para compatibilidade, mas não aparece na navegação/editor.
-- **F5 fechada para desenvolvimento:** Action Inbox unificada com aceite/edição/snooze, anti-duplicação determinística com Kanban legado, FollowUp separado e cron de perguntas sem resposta; WhatsApp com instância/QR, filtro de conversas e `fromMe` antes de persistência/LLM, segredos cifrados e webhook com segredo por instância, desligamento local mesmo se o GO falhar. **444 testes backend** e build web aprovados; migrations validadas em PostgreSQL descartável. A documentação do GO é inconsistente entre wiki/Swagger: fixture e smoke com GO 0.7.2 real e proteção de logs externos são bloqueios de produção, não foram comprovados por mocks; ver [runbook WhatsApp](operacao-whatsapp-evolution-go.md). Envio automático de WhatsApp não está habilitado sem contrato de envio confirmado.
+- **F5 fechada para desenvolvimento:** Action Inbox unificada com aceite/edição/snooze, anti-duplicação determinística com Kanban legado, FollowUp separado e cron de perguntas sem resposta; WhatsApp com instância/QR, filtro de conversas e `fromMe` antes de persistência/LLM, segredos cifrados e webhook com segredo por instância, desligamento local mesmo se o GO falhar. **444 testes backend** e build web aprovados; migrations validadas em PostgreSQL descartável. A documentação do GO é inconsistente entre wiki/Swagger: fixture e smoke com GO 0.7.2 real e proteção de logs externos são bloqueios de produção, não foram comprovados por mocks; ver [runbook WhatsApp](operacao-whatsapp-evolution-go.md). Envio automático de WhatsApp não está habilitado sem contrato de envio confirmado. *(Histórico: o "Kanban legado" das notas foi removido — hoje o quadro é das Tarefas; a Action Inbox é `GET /api/v1/pendencies`, sem o estado `suggested`/`note_suggestion` das notas — ver "Estado atual" no topo.)*
 - **Pendente:** F6 retenção/exclusão, auditoria, observabilidade, preferências de notificação e hardening. O risco de advisories npm e a operação real das integrações exigem validação separada; não substituem as evidências locais de testes.

@@ -147,7 +147,7 @@ export default function Record() {
         const fresh = await getNote(noteId);
         setNote(fresh);
         const fatal = terminalError(fresh);
-        if (fresh.status === "processed" || fresh.status === "no_match") {
+        if (fresh.status === "processed") {
           stopTimers();
           setPhase("done");
         } else if (fatal) {
@@ -314,14 +314,14 @@ export default function Record() {
 
           {note && (phase === "done" || phase === "attention") && (
             <div className={`card ${phase === "done" ? "result-card" : ""}`} style={{ margin: "14px 0 0" }}>
-              <span className={`badge ${note.template_id ? "processed" : "general"}`}>
-                {note.template_id ? "Organizada" : "Nota geral"}
+              <span className={`badge ${note.status !== "processed" ? "pending_review" : note.template_id ? "processed" : "general"}`}>
+                {note.status !== "processed" ? "Geração pendente" : note.template_id ? "Organizada" : "Nota geral"}
               </span>
               <div style={{ fontWeight: 800, marginTop: 8, fontSize: 15 }}>
-                {note.title || "Nota processada com sucesso"}
+                {note.title || (note.status === "processed" ? "Nota processada com sucesso" : "Documento ainda não gerado")}
               </div>
-              {note.raw_transcription && (
-                <div className="muted" style={{ marginTop: 6 }}>{note.raw_transcription.slice(0, 180)}{note.raw_transcription.length > 180 ? "…" : ""}</div>
+              {note.summary && (
+                <div className="muted" style={{ marginTop: 6 }}>{note.summary.slice(0, 180)}{note.summary.length > 180 ? "…" : ""}</div>
               )}
               <div className="row" style={{ marginTop: 12 }}>
                 {note.raw_transcription.trim() !== "" && (

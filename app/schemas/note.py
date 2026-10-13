@@ -29,15 +29,14 @@ class NoteRead(BaseModel):
     user_id: uuid.UUID
     template_id: uuid.UUID | None
     title: str = ""
+    body: str = ""
+    summary: str = ""
     raw_transcription: str
     structured_data: dict[str, Any] | None
     status: NoteStatus
-    kanban_status: str | None = None
     due_date: datetime | None = None
     reminder_at: datetime | None = None
     reminder_sent: bool = False
-    capture_mode: str = "intentional"
-    suggested_action: str | None = None
     created_at: datetime
     logs: list[ExecutionLogRead] = []
 
@@ -62,6 +61,7 @@ class NoteUpdate(BaseModel):
     structured_data: dict[str, Any] | None = None
     template_id: uuid.UUID | None = None
     title: str | None = None
-    kanban_status: str | None = None
+    body: str | None = None
+    summary: str | None = None
     due_date: datetime | None = None
     reminder_at: datetime | None = None

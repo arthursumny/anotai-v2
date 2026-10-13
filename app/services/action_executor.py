@@ -60,7 +60,9 @@ async def _step_is_ready(session: AsyncSession, execution_id: uuid.UUID) -> bool
         return False
     if execution.workflow_step_id is None and execution.workflow_execution_id is None:
         snapshot = execution.policy_snapshot
-        return isinstance(snapshot, dict) and snapshot.get("standalone") is True
+        return isinstance(snapshot, dict) and (
+            snapshot.get("standalone") is True or snapshot.get("origin") == "template"
+        )
     if execution.workflow_step_id is None or execution.workflow_execution_id is None:
         return False
     step = await session.get(WorkflowStep, execution.workflow_step_id)

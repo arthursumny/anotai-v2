@@ -1,4 +1,4 @@
-/** AnotAI mobile — hook de polling da nota após upload (pending_review → processed/no_match). */
+/** AnotAI mobile — acompanha a geração da nota após upload até processed ou falha. */
 
 import { useEffect, useRef, useState } from "react";
 
@@ -40,7 +40,7 @@ export function useNotePolling(noteId: string | null, opts: Options = {}): {
         const fresh = await getNote(noteId);
         if (cancelled) return;
         setNote(fresh);
-        if (fresh.status === "processed" || fresh.status === "no_match") {
+        if (fresh.status === "processed") {
           setState("done");
           return;
         }
@@ -69,7 +69,7 @@ export function useNotePolling(noteId: string | null, opts: Options = {}): {
       }
     };
 
-    timer.current = setTimeout(tick, 500);
+    void tick();
     return () => {
       cancelled = true;
       if (timer.current) clearTimeout(timer.current);

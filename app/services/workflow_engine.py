@@ -20,6 +20,7 @@ from app.models.workspace import WorkspaceMembership
 from app.schemas.workflow_action import ActionValidationError
 from app.services.action_registry import validate_action
 from app.schemas.workflow_action import StructuredAction
+from app.services.template_actions import prepare_template_actions as prepare_template_actions
 
 SUPPORTED_TRIGGERS = frozenset({
     "MANUAL",

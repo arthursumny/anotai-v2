@@ -3,7 +3,7 @@
 import axios, { type AxiosInstance } from "axios";
 import Constants from "expo-constants";
 
-import type { AudioProcessAccepted, Note, NotePatch, Secret, Template, User } from "../types";
+import type { ActionExecution, AudioProcessAccepted, Note, NotePatch, Secret, TaskRead, Template, User } from "../types";
 
 const FALLBACK_API_URL = "http://192.168.0.10:8000/api/v1";
 
@@ -105,21 +105,30 @@ export async function updateNote(noteId: string, patch: NotePatch): Promise<Note
   return data;
 }
 
-/** Re-dispara as ações do template vinculado (após correção manual do JSON). */
+/** Prepara ações duráveis de forma idempotente, sem reenviar ações existentes. */
 export async function redispatchNote(noteId: string): Promise<Note> {
   const { data } = await api.post<Note>(`/notes/${noteId}/dispatch`);
   return data;
 }
 
-/** Envia nota processada (inclusive nota geral) ao Kanban. */
-export async function sendNoteToKanban(noteId: string): Promise<Note> {
-  const { data } = await api.post<Note>(`/notes/${noteId}/to-kanban`);
+/** Repete a geração da nota pendente usando a transcrição salva. */
+export async function retryNote(noteId: string): Promise<Note> {
+  return (await api.post<Note>(`/notes/${noteId}/retry`, undefined, { timeout: 120000 })).data;
+}
+
+export async function listActionExecutions(): Promise<ActionExecution[]> {
+  return (await api.get<ActionExecution[]>("/workflows/executions", { params: { limit: 100 } })).data;
+}
+
+/** Cria uma tarefa vinculada à nota processada (inclusive nota geral). */
+export async function sendNoteToKanban(noteId: string): Promise<TaskRead> {
+  const { data } = await api.post<TaskRead>(`/notes/${noteId}/to-kanban`);
   return data;
 }
 
 /** Cada tarefa da nota geral vira um card no Kanban. */
-export async function splitTasksToKanban(noteId: string): Promise<Note[]> {
-  const { data } = await api.post<Note[]>(`/notes/${noteId}/tasks-to-kanban`);
+export async function splitTasksToKanban(noteId: string): Promise<TaskRead[]> {
+  const { data } = await api.post<TaskRead[]>(`/notes/${noteId}/tasks-to-kanban`);
   return data;
 }
 

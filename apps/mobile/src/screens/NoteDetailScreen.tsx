@@ -20,13 +20,15 @@ import {
   getNote,
   getTemplate,
   listTemplates,
+  listActionExecutions,
   reclassifyNote,
   redispatchNote,
+  retryNote,
   sendNoteToKanban,
   splitTasksToKanban,
   updateNote,
 } from "../services/api";
-import type { Note, Template } from "../types";
+import type { ActionExecution, Note, Template } from "../types";
 
 type Props = NativeStackScreenProps<NotesStackParamList, "NoteDetail">;
 
@@ -72,6 +74,35 @@ function asTasks(v: unknown): GeneralTask[] {
   return out;
 }
 
+function MarkdownBody({ text }: { text: string }): JSX.Element {
+  return (
+    <View>
+      {text.split("\n").map((line, index) => {
+        const heading = /^#{1,6}\s/.test(line);
+        const content = line.replace(/^#{1,6}\s+/, "").replace(/^[-*]\s+/, "• ");
+        return (
+          <Text key={index} style={heading ? styles.section : styles.body}>
+            {content.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+              part.startsWith("**") && part.endsWith("**")
+                ? <Text key={i} style={styles.logTitle}>{part.slice(2, -2)}</Text>
+                : part,
+            )}
+          </Text>
+        );
+      })}
+    </View>
+  );
+}
+
+const ACTION_LABELS: Record<string, string> = {
+  SEND_EMAIL: "Email", CREATE_TASK: "Criar tarefa", SEND_TELEGRAM: "Telegram",
+  SEND_WEBHOOK: "Webhook", CALL_MCP_TOOL: "Ferramenta MCP",
+};
+const ACTION_STATUS: Record<string, string> = {
+  awaiting_confirmation: "Aguardando confirmação", pending: "Aguardando execução",
+  claimed: "Em execução", succeeded: "Concluída", failed: "Falhou",
+};
+
 export default function NoteDetailScreen({ route, navigation }: Props): JSX.Element {
   const { noteId } = route.params;
   const [note, setNote] = useState<Note | null>(null);
@@ -87,6 +118,11 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [draftBody, setDraftBody] = useState("");
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftSummary, setDraftSummary] = useState("");
+  const [retrying, setRetrying] = useState(false);
+  const [actions, setActions] = useState<ActionExecution[]>([]);
+  const [actionsLoading, setActionsLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [kanbanBusy, setKanbanBusy] = useState(false);
@@ -154,31 +190,27 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
   };
 
   const startEditing = (): void => {
-    if (!note?.structured_data) return;
+    if (!note) return;
     const init: Record<string, string> = {};
-    for (const [k, v] of Object.entries(note.structured_data)) init[k] = toEditableText(v);
+    for (const [k, v] of Object.entries(note.structured_data ?? {})) init[k] = toEditableText(v);
     setDraft(init);
-    const sd = note.structured_data as Record<string, unknown>;
-    setDraftBody(typeof sd.nota === "string" ? sd.nota : "");
+    setDraftBody(note.body);
+    setDraftTitle(note.title);
+    setDraftSummary(note.summary);
     setEditing(true);
   };
 
   const handleSaveEdit = async (): Promise<void> => {
     if (!note) return;
-    const sd = (note.structured_data ?? {}) as Record<string, unknown>;
-    const isGeneral = note.template_id === null && typeof sd.nota === "string";
     setSaving(true);
     setError(null);
     try {
-      if (isGeneral) {
-        setNote(await updateNote(noteId, {
-          structured_data: { ...sd, tipo: "nota_geral", nota: draftBody },
-        }));
-      } else {
-        const structured: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(draft)) structured[k] = fromEditableText(v);
-        setNote(await updateNote(noteId, { structured_data: structured }));
-      }
+      const structured: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(draft)) structured[k] = fromEditableText(v);
+      setNote(await updateNote(noteId, {
+        title: draftTitle, body: draftBody, summary: draftSummary,
+        ...(note.structured_data !== null ? { structured_data: structured } : {}),
+      }));
       setEditing(false);
     } catch (e) {
       setError(apiErrorMessage(e));
@@ -191,7 +223,8 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
     setKanbanBusy(true);
     setError(null);
     try {
-      setNote(await sendNoteToKanban(noteId));
+      await sendNoteToKanban(noteId);
+      Alert.alert("Tarefa", "Tarefa vinculada ao documento disponível no quadro.");
     } catch (e) {
       setError(apiErrorMessage(e));
     } finally {
@@ -199,12 +232,12 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
     }
   };
 
-  const handleTasksToKanban = async (count: number): Promise<void> => {
+  const handleTasksToKanban = async (): Promise<void> => {
     setKanbanBusy(true);
     setError(null);
     try {
-      await splitTasksToKanban(noteId);
-      Alert.alert("Kanban", `${count} tarefa(s) criada(s) em A fazer.`);
+      const created = await splitTasksToKanban(noteId);
+      Alert.alert("Kanban", `${created.length} tarefa(s) disponível(is) em A fazer.`);
     } catch (e) {
       setError(apiErrorMessage(e));
     } finally {
@@ -217,10 +250,35 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
     setError(null);
     try {
       setNote(await redispatchNote(noteId));
+      Alert.alert("Ações preparadas", "Ações existentes não são reenviadas. Confira as execuções e as aprovações.");
     } catch (e) {
       setError(apiErrorMessage(e));
     } finally {
       setDispatching(false);
+    }
+  };
+
+  const handleRetry = async (): Promise<void> => {
+    setRetrying(true);
+    setError(null);
+    try {
+      setNote(await retryNote(noteId));
+    } catch (e) {
+      setError(apiErrorMessage(e));
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const loadActions = async (): Promise<void> => {
+    setActionsLoading(true);
+    setError(null);
+    try {
+      setActions((await listActionExecutions()).filter((item) => item.source_id === noteId));
+    } catch (e) {
+      setError(apiErrorMessage(e));
+    } finally {
+      setActionsLoading(false);
     }
   };
 
@@ -247,11 +305,8 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
 
   const entries = note.structured_data ? Object.entries(note.structured_data) : [];
   const sd = (note.structured_data ?? {}) as Record<string, unknown>;
-  const isGeneral =
-    note.template_id === null &&
-    (note.status === "processed" || note.status === "no_match") &&
-    (typeof sd.nota === "string" || Array.isArray(sd.tarefas));
-  const generalBody = typeof sd.nota === "string" ? sd.nota : "";
+  const isGeneral = note.template_id === null && note.status === "processed";
+  const generalBody = note.body;
   const tasks = asTasks(sd.tarefas);
 
   return (
@@ -264,12 +319,13 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
       <Text style={styles.section}>Transcrição</Text>
       <Text style={styles.body}>{note.raw_transcription || "Ainda transcrevendo…"}</Text>
 
-      {isGeneral && (
+      {note.status === "processed" && (
         <>
-          <Text style={styles.section}>Nota geral (IA)</Text>
+          <Text style={styles.section}>{isGeneral ? "Nota geral" : "Documento"}</Text>
           {!editing ? (
             <>
-              <Text style={styles.body}>{generalBody || "—"}</Text>
+              {note.summary ? <Text style={styles.date}>{note.summary}</Text> : null}
+              <MarkdownBody text={generalBody || "Documento sem conteúdo."} />
               {tasks.length > 0 && (
                 <>
                   <Text style={styles.section}>Tarefas ({tasks.length})</Text>
@@ -284,16 +340,13 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
               <View style={styles.sectionRow}>
                 <Text style={styles.section}>Kanban</Text>
               </View>
-              <Text style={styles.body}>
-                {note.kanban_status ? `No quadro: ${note.kanban_status}` : "Fora do quadro"}
-              </Text>
-              {!note.kanban_status && (
+              {(
                 <Pressable style={[styles.secondary, styles.dispatchBtn]} onPress={() => void handleToKanban()} disabled={kanbanBusy}>
-                  {kanbanBusy ? <ActivityIndicator /> : <Text style={styles.secondaryText}>Enviar para o Kanban</Text>}
+                  {kanbanBusy ? <ActivityIndicator /> : <Text style={styles.secondaryText}>Criar tarefa no quadro</Text>}
                 </Pressable>
               )}
               {tasks.length > 0 && (
-                <Pressable style={[styles.secondary, styles.dispatchBtn]} onPress={() => void handleTasksToKanban(tasks.length)} disabled={kanbanBusy}>
+                <Pressable style={[styles.secondary, styles.dispatchBtn]} onPress={() => void handleTasksToKanban()} disabled={kanbanBusy}>
                   {kanbanBusy ? <ActivityIndicator /> : <Text style={styles.secondaryText}>Criar cards das tarefas</Text>}
                 </Pressable>
               )}
@@ -306,6 +359,10 @@ export default function NoteDetailScreen({ route, navigation }: Props): JSX.Elem
             </>
           ) : (
             <>
+              <Text style={styles.k}>Título</Text>
+              <TextInput style={styles.editInput} value={draftTitle} onChangeText={setDraftTitle} editable={!saving} />
+              <Text style={styles.k}>Resumo</Text>
+              <TextInput style={styles.editInput} value={draftSummary} onChangeText={setDraftSummary} multiline editable={!saving} />
               <Text style={styles.k}>Texto da nota</Text>
               <TextInput
                 style={styles.editInput}

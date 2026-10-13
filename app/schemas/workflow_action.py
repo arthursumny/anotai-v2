@@ -11,8 +11,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StrictFloat,
     StrictStr,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -24,6 +26,9 @@ class WorkflowActionType(StrEnum):
     SEND_TELEGRAM = "SEND_TELEGRAM"
     CREATE_CALENDAR_EVENT = "CREATE_CALENDAR_EVENT"
     PIPELINE_TRIGGER = "PIPELINE_TRIGGER"
+    SEND_EMAIL = "SEND_EMAIL"
+    SEND_WEBHOOK = "SEND_WEBHOOK"
+    CALL_MCP_TOOL = "CALL_MCP_TOOL"
 
 
 class ActionValidationError(ValueError):
@@ -47,7 +52,11 @@ class _ActionBase(BaseModel):
     confidence: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def _reject_sensitive_text(self):
+    def _reject_sensitive_text(self, info: ValidationInfo):
+        # Generated document content is explicitly authorized by an owned
+        # template, not an LLM-generated workflow instruction.
+        if info.context and info.context.get("template_authorized") is True:
+            return self
         for name in ("title", "summary", "text"):
             value = getattr(self, name, None)
             if isinstance(value, str) and (
@@ -84,7 +93,47 @@ class CreateReminderAction(_ActionBase):
 
 class SendTelegramAction(_ActionBase):
     type: Literal[WorkflowActionType.SEND_TELEGRAM] = WorkflowActionType.SEND_TELEGRAM
-    text: StrictStr = Field(min_length=1, max_length=2000)
+    text: StrictStr = Field(min_length=1, max_length=4000)
+
+    @field_validator("text")
+    @classmethod
+    def _workflow_text_limit(cls, value: str, info: ValidationInfo) -> str:
+        if len(value) > 2000 and not (info.context and info.context.get("template_authorized") is True):
+            raise ValueError("Texto do workflow excede 2000 caracteres")
+        return value
+
+
+class SendEmailAction(_ActionBase):
+    type: Literal[WorkflowActionType.SEND_EMAIL] = WorkflowActionType.SEND_EMAIL
+    subject: StrictStr = Field(min_length=1, max_length=998)
+    body: StrictStr = Field(min_length=1, max_length=200000)
+    to: StrictStr | None = Field(default=None, max_length=320)
+
+    @field_validator("subject")
+    @classmethod
+    def _single_line_subject(cls, value: str) -> str:
+        if "\r" in value or "\n" in value:
+            raise ValueError("Assunto deve ter uma linha")
+        return value
+
+    @field_validator("to")
+    @classmethod
+    def _single_mailbox(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[^@\s,;<>\r\n]+@[^@\s,;<>\r\n]+\.[^@\s,;<>\r\n]+", value):
+            raise ValueError("Destinatário inválido")
+        return value
+
+
+class SendWebhookAction(_ActionBase):
+    """Provider location and credentials stay in the owned template."""
+
+    type: Literal[WorkflowActionType.SEND_WEBHOOK] = WorkflowActionType.SEND_WEBHOOK
+    body: dict[str, JsonValue]
+
+
+class CallMCPToolAction(_ActionBase):
+    type: Literal[WorkflowActionType.CALL_MCP_TOOL] = WorkflowActionType.CALL_MCP_TOOL
+    arguments: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class CreateCalendarEventAction(_ActionBase):
@@ -137,6 +186,7 @@ def _parse_datetime(value):
 
 
 StructuredAction: TypeAlias = Annotated[
-    CreateTaskAction | CreateReminderAction | SendTelegramAction | CreateCalendarEventAction | PipelineTriggerAction,
+    CreateTaskAction | CreateReminderAction | SendTelegramAction | CreateCalendarEventAction | PipelineTriggerAction
+    | SendEmailAction | SendWebhookAction | CallMCPToolAction,
     Field(discriminator="type"),
 ]

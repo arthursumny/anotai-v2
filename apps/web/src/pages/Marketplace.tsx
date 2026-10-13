@@ -5,10 +5,10 @@ import Icon from "../components/Icon";
 
 const ACTION_LABELS: Record<string, string> = {
   telegram: "Telegram",
-  whatsapp: "WhatsApp",
   webhook: "Serviço conectado",
   mcp_tool: "Aplicativo conectado",
   email: "E-mail",
+  create_task: "Criar tarefa",
 };
 
 function actionLabel(type: string): string {

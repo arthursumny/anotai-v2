@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   apiError,
   deleteNote,
@@ -8,6 +8,7 @@ import {
   patchNote,
   reclassifyNote,
   redispatchNote,
+  retryNote,
   sendNoteToKanban,
   splitTasksToKanban,
 } from "../api";
@@ -129,6 +130,8 @@ export default function NoteDetail() {
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [draftTitle, setDraftTitle] = useState("");
   const [draftBody, setDraftBody] = useState("");
+  const [draftSummary, setDraftSummary] = useState("");
+  const [retrying, setRetrying] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [kanbanBusy, setKanbanBusy] = useState(false);
@@ -187,12 +190,13 @@ export default function NoteDetail() {
   };
 
   const startEdit = () => {
-    if (!note?.structured_data) return;
+    if (!note) return;
     const d: Record<string, string> = {};
-    for (const [k, v] of Object.entries(note.structured_data)) d[k] = toText(v);
+    for (const [k, v] of Object.entries(note.structured_data ?? {})) d[k] = toText(v);
     setDraft(d);
     setDraftTitle(note.title ?? "");
-    setDraftBody(typeof note.structured_data.nota === "string" ? note.structured_data.nota : "");
+    setDraftBody(note.body);
+    setDraftSummary(note.summary);
     setEditing(true);
   };
 
@@ -201,20 +205,12 @@ export default function NoteDetail() {
     setSaving(true);
     setError(null);
     try {
-      if (isGeneral) {
-        const tarefas = asTasks(note.structured_data?.tarefas);
-        const structured: Record<string, unknown> = {
-          ...(note.structured_data ?? {}),
-          tipo: "nota_geral",
-          nota: draftBody,
-          tarefas,
-        };
-        setNote(await patchNote(id, { title: draftTitle, structured_data: structured }));
-      } else {
-        const structured: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(draft)) structured[k] = fromText(v);
-        setNote(await patchNote(id, { structured_data: structured }));
-      }
+      const structured: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(draft)) structured[k] = fromText(v);
+      setNote(await patchNote(id, {
+        title: draftTitle, body: draftBody, summary: draftSummary,
+        ...(note.structured_data !== null ? { structured_data: structured } : {}),
+      }));
       setEditing(false);
     } catch (e) {
       setError(apiError(e));
@@ -229,10 +225,24 @@ export default function NoteDetail() {
     setError(null);
     try {
       setNote(await redispatchNote(id));
+      setTaskMessage("Ações preparadas. Acompanhe a execução e as aprovações em Fluxos e Revisar; ações existentes não são reenviadas.");
     } catch (e) {
       setError(apiError(e));
     } finally {
       setDispatching(false);
+    }
+  };
+
+  const retryGeneration = async () => {
+    if (!id) return;
+    setRetrying(true);
+    setError(null);
+    try {
+      setNote(await retryNote(id));
+    } catch (e) {
+      setError(apiError(e));
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -241,7 +251,8 @@ export default function NoteDetail() {
     setKanbanBusy(true);
     setError(null);
     try {
-      setNote(await sendNoteToKanban(id));
+      await sendNoteToKanban(id);
+      setTaskMessage("Tarefa disponível no quadro.");
     } catch (e) {
       setError(apiError(e));
     } finally {
@@ -307,12 +318,8 @@ export default function NoteDetail() {
   if (!note) return <div className="center">{error ?? "Nota não encontrada."}</div>;
 
   const sd = (note.structured_data ?? {}) as Record<string, unknown>;
-  const isGeneral =
-    note.template_id === null &&
-    (note.status === "processed" || note.status === "no_match") &&
-    (typeof sd.nota === "string" || Array.isArray(sd.tarefas));
-  const legacyEmptyNoMatch = note.status === "no_match" && !isGeneral;
-  const generalBody = typeof sd.nota === "string" ? sd.nota : "";
+  const isGeneral = note.template_id === null && note.status === "processed";
+  const generalBody = note.body;
   const tasks = asTasks(sd.tarefas);
   const kanbanTaskIds = Array.isArray(sd.kanban_task_ids) ? sd.kanban_task_ids : [];
   const entries = note.structured_data ? Object.entries(note.structured_data) : [];
@@ -325,17 +332,17 @@ export default function NoteDetail() {
       <div className="page-head">
         <div>
           <h1>Detalhes da Nota</h1>
-          <p className="muted" style={{ margin: "6px 0 0" }}>{new Date(note.created_at).toLocaleString()} · {note.capture_mode}{note.kanban_status ? ` · Kanban: ${note.kanban_status}` : ""}</p>
+          <p className="muted" style={{ margin: "6px 0 0" }}>{new Date(note.created_at).toLocaleString()}</p>
         </div>
       </div>
       {error && <p className="error">{error}</p>}
       <StatusBadge status={note.status} templateId={note.template_id} />
       {note.title && <h2 style={{ margin: "10px 0 0", fontFamily: "Sora, Inter, sans-serif" }}>{note.title}</h2>}
 
-      <div className="card">
-        <b>Transcrição</b>
+      <details className="card">
+        <summary>Transcrição original</summary>
         <p>{note.raw_transcription || "Ainda transcrevendo…"}</p>
-      </div>
+      </details>
 
       <section className="card reminder-card">
         <div>
@@ -356,24 +363,27 @@ export default function NoteDetail() {
 
       {taskMessage && <p className="connections-message" role="status">{taskMessage}</p>}
 
-      {legacyEmptyNoMatch && (
-        <div className="card" style={{ borderColor: "#fcd34d", background: "#fffbeb" }}>
-          <p>Nota antiga sem interpretação. Associe um template para estruturar.</p>
-          <button onClick={() => void openPicker()}>Associar template manualmente</button>
+      {note.status === "pending_review" && (
+        <div className="card">
+          <p>O documento ainda não foi gerado. A transcrição original está preservada.</p>
+          <button disabled={retrying || !note.raw_transcription.trim()} onClick={() => void retryGeneration()}>
+            {retrying ? "Gerando…" : "Tentar gerar novamente"}
+          </button>
         </div>
       )}
 
-      {isGeneral && (
+      {note.status === "processed" && (
         <div className="card">
           <div className="row" style={{ justifyContent: "space-between" }}>
-            <b>Nota geral (IA)</b>
+            <b>{isGeneral ? "Nota geral" : "Documento"}</b>
             {!editing
               ? <button className="btn-secondary" onClick={startEdit}>Editar</button>
               : <button className="btn-secondary" onClick={() => setEditing(false)} disabled={saving}>Cancelar</button>}
           </div>
           {!editing ? (
             <>
-              {generalBody ? <Markdown text={generalBody} /> : <p className="muted">—</p>}
+              {note.summary && <p className="muted">{note.summary}</p>}
+              {generalBody ? <Markdown text={generalBody} /> : <p className="muted">Documento sem conteúdo.</p>}
               {tasks.length > 0 && (
                 <div style={{ marginTop: 10 }}>
                   <b>Tarefas identificadas ({tasks.length})</b>
@@ -398,6 +408,8 @@ export default function NoteDetail() {
             <>
               <label>Título</label>
               <input value={draftTitle} disabled={saving} onChange={(e) => setDraftTitle(e.target.value)} />
+              <label>Resumo</label>
+              <textarea value={draftSummary} disabled={saving} onChange={(e) => setDraftSummary(e.target.value)} />
               <label style={{ marginTop: 8 }}>Nota (markdown: listas, tópicos…)</label>
               <textarea
                 value={draftBody}
@@ -416,19 +428,17 @@ export default function NoteDetail() {
         </div>
       )}
 
-      {isGeneral && (
+      {note.status === "processed" && (
         <div className="card">
           <b>Kanban</b>
           {kanbanTaskIds.length > 0 && (
             <p className="muted">{kanbanTaskIds.length} tarefa(s) desta nota já estão no quadro.</p>
           )}
-          {note.kanban_status
-            ? <p className="muted">Esta nota está no Kanban ({note.kanban_status}).</p>
-            : <p className="muted">Leve a nota ou as tarefas para o quadro.</p>}
+          <p className="muted">Crie uma tarefa vinculada a este documento.</p>
           <div className="row">
-            {!note.kanban_status && (
+            {(
               <button disabled={kanbanBusy} onClick={() => void toKanban()}>
-                {kanbanBusy ? "Enviando…" : "Enviar nota para o Kanban"}
+                {kanbanBusy ? "Criando…" : "Criar tarefa no quadro"}
               </button>
             )}
             {tasks.length > 0 && kanbanTaskIds.length === 0 && (
@@ -440,20 +450,11 @@ export default function NoteDetail() {
         </div>
       )}
 
-      {!isGeneral && kanbanTaskIds.length > 0 && (
-        <div className="card">
-          <b>Tarefas criadas</b>
-          <p className="muted">{kanbanTaskIds.length} tarefa(s) desta nota já estão no quadro. Você pode organizar as etapas em Tarefas.</p>
-        </div>
-      )}
-
-      {!isGeneral && (note.status === "processed" || note.status === "pending_review") && (
-        <div className="card">
+      {entries.length > 0 && (
+        <details className="card">
+          <summary>Dados estruturados (campos auxiliares)</summary>
           <div className="row" style={{ justifyContent: "space-between" }}>
             <b>Dados estruturados</b>
-            {!editing
-              ? <button className="btn-secondary" onClick={startEdit} disabled={entries.length === 0}>Editar</button>
-              : <button className="btn-secondary" onClick={() => setEditing(false)} disabled={saving}>Cancelar</button>}
           </div>
           {templatedEntries.length === 0 && <p className="muted">—</p>}
           {!editing
@@ -465,19 +466,12 @@ export default function NoteDetail() {
                   onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))} />
               </div>
             ))}
-          {editing && (
-            <div style={{ marginTop: 10 }}>
-              <button disabled={saving} onClick={() => void saveEdit()}>
-                {saving ? "Salvando…" : "Salvar alterações"}
-              </button>
-            </div>
-          )}
-        </div>
+        </details>
       )}
 
       {note.logs.length > 0 && (
         <div className="card">
-          <b>Ações disparadas</b>
+          <b>Histórico de geração</b>
           {note.logs.map((lg) => (
             <div key={lg.id} className="log">
               <b>{lg.action_type}</b> — {lg.status === "success" ? "ok" : "falhou"}
@@ -488,9 +482,11 @@ export default function NoteDetail() {
       )}
 
       <div className="row">
-        {!isGeneral && (note.status === "processed" || note.status === "pending_review") && note.template_id && (
+        <Link to="/fluxos" className="btn btn-secondary">Ver execuções das ações</Link>
+        <Link to="/inbox" className="btn btn-secondary">Revisar aprovações</Link>
+        {note.status === "processed" && note.template_id && (
           <button className="btn-secondary" disabled={dispatching} onClick={() => void redispatch()}>
-            {dispatching ? "Disparando…" : "Re-disparar ações"}
+            {dispatching ? "Preparando…" : "Preparar ações"}
           </button>
         )}
         {note.status !== "discarded" && (

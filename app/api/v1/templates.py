@@ -4,16 +4,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import text
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.database import get_session
 from app.core.deps import get_current_user
 from app.models.template import Template
-from app.models.template_routing_rule import TemplateRoutingRule
 from app.models.user import User
-from app.models.workspace import WorkspaceMembership
 from app.schemas.template import (
     DeriveRequest,
     DeriveResponse,
@@ -21,9 +18,6 @@ from app.schemas.template import (
     TemplateDraft,
     TemplateDraftRequest,
     TemplateRead,
-    TemplateRoutingRuleCreate,
-    TemplateRoutingRuleRead,
-    TemplateRoutingRuleUpdate,
     TemplateUpdate,
 )
 from app.services.template_drafter import DraftError, derive_from_example, draft_template
@@ -150,109 +144,3 @@ async def delete_template(
     await session.commit()
 
 
-async def _require_workspace_membership(session: AsyncSession, current: User) -> uuid.UUID:
-    workspace_id = current.workspace_id
-    if workspace_id is None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Workspace não disponível")
-    membership = await session.exec(select(WorkspaceMembership.id).where(
-        WorkspaceMembership.workspace_id == workspace_id,
-        WorkspaceMembership.user_id == current.id,
-    ))
-    if membership.first() is None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Membership do workspace necessária")
-    return workspace_id
-
-
-async def _get_owned_routing_rule(
-    session: AsyncSession,
-    template_id: uuid.UUID,
-    rule_id: uuid.UUID,
-    current: User,
-) -> TemplateRoutingRule:
-    workspace_id = await _require_workspace_membership(session, current)
-    await _get_owned(session, template_id, current.id)
-    rule = (await session.exec(select(TemplateRoutingRule).where(
-        TemplateRoutingRule.id == rule_id,
-        TemplateRoutingRule.workspace_id == workspace_id,
-        TemplateRoutingRule.user_id == current.id,
-        TemplateRoutingRule.template_id == template_id,
-    ))).first()
-    if rule is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Regra não encontrada")
-    return rule
-
-
-@router.get(
-    "/{template_id}/routing-rules", response_model=list[TemplateRoutingRuleRead],
-)
-async def list_template_routing_rules(
-    template_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current: User = Depends(get_current_user),
-) -> list[TemplateRoutingRule]:
-    workspace_id = await _require_workspace_membership(session, current)
-    await _get_owned(session, template_id, current.id)
-    rules = await session.exec(select(TemplateRoutingRule).where(
-        TemplateRoutingRule.workspace_id == workspace_id,
-        TemplateRoutingRule.user_id == current.id,
-        TemplateRoutingRule.template_id == template_id,
-    ).order_by(text("priority DESC"), text("created_at")))
-    return list(rules.all())
-
-
-@router.post(
-    "/{template_id}/routing-rules", response_model=TemplateRoutingRuleRead,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_template_routing_rule(
-    template_id: uuid.UUID,
-    data: TemplateRoutingRuleCreate,
-    session: AsyncSession = Depends(get_session),
-    current: User = Depends(get_current_user),
-) -> TemplateRoutingRule:
-    workspace_id = await _require_workspace_membership(session, current)
-    template = await _get_owned(session, template_id, current.id)
-    rule = TemplateRoutingRule(
-        workspace_id=workspace_id,
-        user_id=current.id,
-        template_id=template.id,
-        **data.model_dump(),
-    )
-    session.add(rule)
-    await session.commit()
-    await session.refresh(rule)
-    return rule
-
-
-@router.patch(
-    "/{template_id}/routing-rules/{rule_id}", response_model=TemplateRoutingRuleRead,
-)
-async def update_template_routing_rule(
-    template_id: uuid.UUID,
-    rule_id: uuid.UUID,
-    data: TemplateRoutingRuleUpdate,
-    session: AsyncSession = Depends(get_session),
-    current: User = Depends(get_current_user),
-) -> TemplateRoutingRule:
-    rule = await _get_owned_routing_rule(session, template_id, rule_id, current)
-    for key, value in data.model_dump(exclude_unset=True).items():
-        setattr(rule, key, value)
-    rule.updated_at = datetime.now(timezone.utc)
-    session.add(rule)
-    await session.commit()
-    await session.refresh(rule)
-    return rule
-
-
-@router.delete(
-    "/{template_id}/routing-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT,
-)
-async def delete_template_routing_rule(
-    template_id: uuid.UUID,
-    rule_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current: User = Depends(get_current_user),
-) -> None:
-    rule = await _get_owned_routing_rule(session, template_id, rule_id, current)
-    await session.delete(rule)
-    await session.commit()

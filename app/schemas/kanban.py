@@ -1,31 +1,20 @@
-"""AnotAI — schemas da inbox de triagem e do Kanban (Pydantic v2)."""
+"""AnotAI — schemas do quadro Kanban (Pydantic v2)."""
 
 from datetime import datetime
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from app.schemas.note import NoteRead
-
-KanbanStatus = Literal["todo", "in_progress", "done"]
-
-
-class InboxAccept(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kanban_status: KanbanStatus = "todo"
-    due_date: datetime | None = None
-    reminder_at: datetime | None = None
+from app.schemas.task import KanbanStatus, TaskRead
 
 
 class KanbanMove(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kanban_status: KanbanStatus
-    due_date: datetime | None = None
+    due_at: datetime | None = Field(default=None, validation_alias=AliasChoices("due_at", "due_date"))
 
 
 class KanbanBoard(BaseModel):
-    todo: list[NoteRead] = []
-    in_progress: list[NoteRead] = []
-    done: list[NoteRead] = []
+    todo: list[TaskRead] = Field(default_factory=list)
+    in_progress: list[TaskRead] = Field(default_factory=list)
+    done: list[TaskRead] = Field(default_factory=list)

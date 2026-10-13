@@ -19,12 +19,11 @@ import Icon from "../components/Icon";
 /* ----------------------------------------------------------------- apoio */
 
 const KIND_META: Record<PendencyKind, { label: string; badge: string }> = {
-  note_suggestion: { label: "Nota", badge: "pending_review" },
   task: { label: "Tarefa", badge: "general" },
   reminder: { label: "Lembrete", badge: "general" },
-  follow_up: { label: "Acompanhamento", badge: "no_match" },
+  follow_up: { label: "Acompanhamento", badge: "warning" },
   action: { label: "Ação sugerida", badge: "pending_review" },
-  approval: { label: "Aprovação", badge: "suggested" },
+  approval: { label: "Aprovação", badge: "warning" },
 };
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -42,6 +41,9 @@ const APPROVAL_ACTION_LABELS: Record<string, string> = {
   CREATE_TASK: "Criar tarefa",
   CREATE_REMINDER: "Criar lembrete",
   SEND_TELEGRAM: "Enviar mensagem no seu Telegram",
+  SEND_EMAIL: "Enviar email",
+  SEND_WEBHOOK: "Enviar webhook",
+  CALL_MCP_TOOL: "Executar ferramenta MCP",
   CREATE_CALENDAR_EVENT: "Criar evento na agenda",
 };
 
@@ -173,6 +175,13 @@ function ApprovalBody({ item, onDone }: { item: PendencyItem; onDone: () => void
                     <div className="log">{previewStr(detail.preview, "text")}</div>
                   </>
                 )}
+                {detail.preview.action_type === "SEND_EMAIL" && (
+                  <>
+                    <div className="kv"><b>Destinatário</b><span>{previewStr(detail.preview, "to") || "Email da sua conta"}</span></div>
+                    <div className="kv"><b>Assunto</b><span>{previewStr(detail.preview, "subject")}</span></div>
+                    <div className="log" style={{ whiteSpace: "pre-wrap" }}>{previewStr(detail.preview, "body")}</div>
+                  </>
+                )}
                 {detail.preview.action_type === "CREATE_CALENDAR_EVENT" && (
                   <>
                     <div className="kv"><b>Evento</b><span>{previewStr(detail.preview, "summary")}</span></div>
@@ -187,7 +196,7 @@ function ApprovalBody({ item, onDone }: { item: PendencyItem; onDone: () => void
                     )}
                   </>
                 )}
-                {!["CREATE_TASK", "CREATE_REMINDER", "SEND_TELEGRAM", "CREATE_CALENDAR_EVENT"].includes(String(detail.preview.action_type)) && (
+                {!["CREATE_TASK", "CREATE_REMINDER", "SEND_TELEGRAM", "SEND_EMAIL", "CREATE_CALENDAR_EVENT"].includes(String(detail.preview.action_type)) && (
                   <p className="muted">Este tipo de ação não tem prévia aqui.</p>
                 )}
                 <div className="row" style={{ marginTop: 10 }}>
@@ -262,13 +271,6 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
   };
 
   const accept = () => {
-    if (item.kind === "note_suggestion") {
-      return act("accept", () =>
-        acceptPendency(item.kind, item.id, {
-          due_at: localToIso(due),
-          remind_at: localToIso(remind),
-        }), "Adicionada às tarefas.");
-    }
     if (item.kind === "task") {
       return act("accept", () =>
         acceptPendency(item.kind, item.id, {
@@ -394,11 +396,6 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
                 <input value={title} onChange={(e) => setTitle(e.target.value)} />
               </label>
             )}
-            {item.kind === "note_suggestion" && (
-              <label>Prazo
-                <input type="datetime-local" value={due} onChange={(e) => setDue(e.target.value)} />
-              </label>
-            )}
             {item.kind === "task" && (
               <label>Prazo
                 <input type="datetime-local" value={due} onChange={(e) => setDue(e.target.value)} />
@@ -406,11 +403,6 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
             )}
             {(item.kind === "reminder" || item.kind === "follow_up") && (
               <label>{item.kind === "reminder" ? "Lembrar em" : "Retomar em"}
-                <input type="datetime-local" value={remind} onChange={(e) => setRemind(e.target.value)} />
-              </label>
-            )}
-            {item.kind === "note_suggestion" && (
-              <label>Lembrete
                 <input type="datetime-local" value={remind} onChange={(e) => setRemind(e.target.value)} />
               </label>
             )}
@@ -443,11 +435,6 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
       {note && <p className="muted" role="status"><b>{note}</b></p>}
 
       <div className="row inbox-actions">
-        {item.kind === "note_suggestion" && (
-          <button disabled={busy !== null} onClick={() => void accept()}>
-            {busy === "accept" ? "Salvando…" : "Adicionar às tarefas"}
-          </button>
-        )}
         {item.kind === "task" && (
           <button disabled={busy !== null} onClick={() => void accept()}>
             {busy === "accept" ? "Salvando…" : "Aceitar"}
@@ -468,7 +455,7 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
             {busy === "resolve" ? "Salvando…" : "Marcar resolvido"}
           </button>
         )}
-        {canAdjust && item.kind !== "note_suggestion" && (
+        {canAdjust && (
           <button className="btn-secondary" disabled={busy !== null} onClick={() => void saveEdits()}>
             {busy === "edit" ? "Salvando…" : "Salvar ajustes"}
           </button>
@@ -477,9 +464,6 @@ function PendencyCard({ item, onDone }: { item: PendencyItem; onDone: () => void
           <button className="btn-secondary" disabled={busy !== null} onClick={() => void ignore()}>
             {busy === "ignore" ? "…" : "Ignorar"}
           </button>
-        )}
-        {item.kind === "note_suggestion" && (
-          <Link to={`/notas/${item.id}`} className="btn btn-secondary">Ver nota</Link>
         )}
       </div>
     </article>

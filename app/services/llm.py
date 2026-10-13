@@ -1,27 +1,24 @@
-"""AnotAI — helper de Chat Completions com fallback de `temperature`.
-
-Alguns modelos (ex: `gpt-6-luna`) só aceitam o valor padrão de temperature e
-rejeitam `temperature=0` com 400 `unsupported_value`. Aqui tentamos primeiro
-com o valor configurado e, só nesse erro específico, repetimos sem o parâmetro.
-"""
+"""OpenAI completion and lossless input partitioning."""
 
 from typing import Any
 
-from openai import AsyncOpenAI, BadRequestError
+from openai import AsyncOpenAI
+
+from app.core.config import settings
 
 
-def _is_temperature_error(exc: BaseException) -> bool:
-    if isinstance(exc, BadRequestError) and getattr(exc, "code", "") == "unsupported_value":
-        return "temperature" in str(exc).lower()
-    return "temperature" in str(exc).lower() and "does not support" in str(exc).lower()
+def transcription_chunks(text: str) -> list[str]:
+    """Partition the entire input without dropping separators or trailing text."""
+    size = settings.OPENAI_TRANSCRIPT_CHUNK_CHARS
+    return [text[start:start + size] for start in range(0, len(text), size)]
 
 
 async def chat_create(client: AsyncOpenAI, **kwargs: Any) -> Any:
-    """`client.chat.completions.create` com retry sem `temperature` se rejeitado."""
-    try:
-        return await client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
-    except Exception as exc:
-        if kwargs.get("temperature") is not None and _is_temperature_error(exc):
-            kwargs.pop("temperature")
-            return await client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
-        raise
+    """Use the model's default temperature; reject incomplete output."""
+    parameters = {key: value for key, value in kwargs.items() if key != "temperature"}
+    response = await client.chat.completions.create(**parameters)
+    if not response.choices or response.choices[0].finish_reason not in {"stop", "tool_calls"}:
+        raise ValueError("A OpenAI não concluiu a resposta; conteúdo não será salvo como completo")
+    if response.choices[0].message.refusal:
+        raise ValueError("A OpenAI não gerou o conteúdo solicitado")
+    return response

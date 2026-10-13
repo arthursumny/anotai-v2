@@ -39,6 +39,9 @@ const ACTION_LABELS: Record<string, string> = {
   CREATE_TASK: "Criar tarefa",
   CREATE_REMINDER: "Criar lembrete",
   SEND_TELEGRAM: "Enviar mensagem no meu Telegram",
+  SEND_EMAIL: "Enviar email",
+  SEND_WEBHOOK: "Enviar webhook",
+  CALL_MCP_TOOL: "Executar ferramenta MCP",
   CREATE_CALENDAR_EVENT: "Criar evento na agenda",
 };
 
@@ -46,7 +49,7 @@ const ACTION_LABELS: Record<string, string> = {
  * Ações "com efeito fora da tela": sem confirmação (per-step) ou sozinhas
  * (preferências) só quando o modo geral for Automático.
  */
-const AUTO_GATE_ACTIONS = new Set(["SEND_TELEGRAM", "CREATE_CALENDAR_EVENT"]);
+const AUTO_GATE_ACTIONS = new Set(["SEND_TELEGRAM", "SEND_EMAIL", "SEND_WEBHOOK", "CALL_MCP_TOOL", "CREATE_CALENDAR_EVENT"]);
 
 const deviceTimeZone = (): string => {
   try {

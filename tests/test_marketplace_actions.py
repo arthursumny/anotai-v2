@@ -6,10 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import app.services.dispatcher as dispatcher
 from app.models.note import Note, NoteStatus
 from app.models.template import Template
-from app.services.dispatcher import dispatch_actions
+from app.services.integration_service import IntegrationService
+from app.services.template_actions import TemplateActionError, prepare_template_actions
+from tests.automation_helpers import execute_actions, persist_generation
 
 
 async def test_clone_disables_every_action_without_mutating_public_template(client, auth_headers, db_session):
@@ -60,43 +61,40 @@ def _note_and_template(uid: uuid.UUID, actions: list[dict]) -> tuple[Note, Templ
     return note, template
 
 
-async def test_dispatch_skips_disabled_actions_and_runs_legacy_actions(monkeypatch, db_session):
+async def test_dispatch_skips_disabled_and_legacy_actions(monkeypatch, db_session):
     post_webhook = AsyncMock(return_value={"status_code": 200})
-    call_mcp = AsyncMock()
-    monkeypatch.setattr(dispatcher, "_post_webhook", post_webhook)
-    monkeypatch.setattr(dispatcher, "_call_mcp_tool", call_mcp)
+    monkeypatch.setattr(IntegrationService, "_send_webhook", post_webhook)
     uid = uuid.uuid4()
     note, template = _note_and_template(uid, [
         {"type": "webhook", "enabled": False, "config": {"url": "https://example.test/disabled"}},
         {"type": "mcp_tool", "enabled": False, "config": {}},
         {"type": "webhook", "config": {"url": "https://example.test/legacy"}},
+        {"type": "webhook", "enabled": True, "config": {"url": "https://example.test/enabled"}},
     ])
 
-    logs = await dispatch_actions(note, template, db_session)
+    await persist_generation(db_session, note, template)
+    logs = await execute_actions(db_session, note)
 
     post_webhook.assert_awaited_once()
-    assert post_webhook.await_args.args[0]["url"] == "https://example.test/legacy"  # type: ignore[union-attr]
-    call_mcp.assert_not_awaited()
+    assert post_webhook.await_args.args[3].config["url"] == "https://example.test/enabled"
     assert len(logs) == 1
-    assert logs[0].status.value == "success"
-    assert logs[0].action_type == "webhook"
+    assert logs[0].status == "succeeded"
+    assert logs[0].action_type == "SEND_WEBHOOK"
 
 
 async def test_dispatch_all_disabled_actions_produce_no_logs_or_external_calls(monkeypatch, db_session):
     post_webhook = AsyncMock()
-    call_mcp = AsyncMock()
-    monkeypatch.setattr(dispatcher, "_post_webhook", post_webhook)
-    monkeypatch.setattr(dispatcher, "_call_mcp_tool", call_mcp)
+    monkeypatch.setattr(IntegrationService, "_send_webhook", post_webhook)
     note, template = _note_and_template(uuid.uuid4(), [
         {"type": "webhook", "enabled": False, "config": {}},
         {"type": "mcp_tool", "enabled": False, "config": {}},
     ])
 
-    logs = await dispatch_actions(note, template, db_session)
+    await persist_generation(db_session, note, template)
+    logs = await execute_actions(db_session, note)
 
     assert logs == []
     post_webhook.assert_not_awaited()
-    call_mcp.assert_not_awaited()
 
 
 async def test_create_and_patch_preserve_explicit_enabled_value(client, auth_headers):
@@ -165,11 +163,12 @@ async def test_cloned_action_runs_only_after_patch_enables_it(client, auth_heade
     clone_id = uuid.UUID(clone_response.json()["id"])
 
     post_webhook = AsyncMock(return_value={"status_code": 200})
-    monkeypatch.setattr(dispatcher, "_post_webhook", post_webhook)
+    monkeypatch.setattr(IntegrationService, "_send_webhook", post_webhook)
     clone = await db_session.get(Template, clone_id)
     assert clone is not None
     note, _ = _note_and_template(uuid.UUID(user_id), [])
-    assert await dispatch_actions(note, clone, db_session) == []
+    await persist_generation(db_session, note, clone)
+    assert await execute_actions(db_session, note) == []
     post_webhook.assert_not_awaited()
 
     patch_response = await client.patch(
@@ -179,16 +178,20 @@ async def test_cloned_action_runs_only_after_patch_enables_it(client, auth_heade
     )
     assert patch_response.status_code == 200, patch_response.text
     await db_session.refresh(clone)
-    logs = await dispatch_actions(note, clone, db_session)
-    assert len(logs) == 1 and logs[0].status.value == "success"
+    # Existing documents retain their generation version; enabling a template
+    # authorizes the next generation, never a stale previous document.
+    with pytest.raises(TemplateActionError, match="version"):
+        await prepare_template_actions(db_session, note, note.user_id)
+    next_note, _ = _note_and_template(uuid.UUID(user_id), [])
+    await persist_generation(db_session, next_note, clone)
+    logs = await execute_actions(db_session, next_note)
+    assert len(logs) == 1 and logs[0].status == "succeeded"
     post_webhook.assert_awaited_once()
 
 
 async def test_public_templates_never_execute_even_when_enabled_or_legacy(monkeypatch, db_session):
     post_webhook = AsyncMock()
-    load_secrets = AsyncMock()
-    monkeypatch.setattr(dispatcher, "_post_webhook", post_webhook)
-    monkeypatch.setattr(dispatcher, "load_user_secrets", load_secrets)
+    monkeypatch.setattr(IntegrationService, "_send_webhook", post_webhook)
     uid = uuid.uuid4()
     note, template = _note_and_template(uid, [
         {"type": "webhook", "enabled": True, "config": {"url": "https://example.test/enabled"}},
@@ -196,11 +199,10 @@ async def test_public_templates_never_execute_even_when_enabled_or_legacy(monkey
     ])
     template.user_id = None
 
-    logs = await dispatch_actions(note, template, db_session)
-
-    assert logs == []
+    await persist_generation(db_session, note, template)
+    with pytest.raises(TemplateActionError, match="template_scope"):
+        await prepare_template_actions(db_session, note, note.user_id)
     post_webhook.assert_not_awaited()
-    load_secrets.assert_not_awaited()
 
 
 async def test_clone_copies_routing_metadata_and_resets_copy_version(client, auth_headers, db_session):

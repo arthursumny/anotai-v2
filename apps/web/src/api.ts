@@ -18,7 +18,7 @@ import type {
   PrivacyDeleteResult,
   PrivacySource,
   PrivacySummary,
-  RoutingRule,
+  TaskRead,
   Secret,
   SourcePolicy,
   Template,
@@ -125,12 +125,16 @@ export async function redispatchNote(id: string): Promise<Note> {
   return (await api.post<Note>(`/notes/${id}/dispatch`)).data;
 }
 
-export async function sendNoteToKanban(id: string): Promise<Note> {
-  return (await api.post<Note>(`/notes/${id}/to-kanban`)).data;
+export async function retryNote(id: string): Promise<Note> {
+  return (await api.post<Note>(`/notes/${id}/retry`, undefined, { timeout: 120000 })).data;
 }
 
-export async function splitTasksToKanban(id: string): Promise<Note[]> {
-  return (await api.post<Note[]>(`/notes/${id}/tasks-to-kanban`)).data;
+export async function sendNoteToKanban(id: string): Promise<TaskRead> {
+  return (await api.post<TaskRead>(`/notes/${id}/to-kanban`)).data;
+}
+
+export async function splitTasksToKanban(id: string): Promise<TaskRead[]> {
+  return (await api.post<TaskRead[]>(`/notes/${id}/tasks-to-kanban`)).data;
 }
 
 export async function deleteNote(id: string): Promise<void> {
@@ -170,29 +174,6 @@ export async function deriveTemplate(
   example_output: string,
 ): Promise<{ semantic_trigger: string; fields: TemplateDraft["fields"]; suggested_message: string }> {
   return (await api.post("/templates/derive", { example_output }, { timeout: 120000 })).data;
-}
-
-// --- regras fortes de roteamento do template ---
-export const listRoutingRules = async (templateId: string): Promise<RoutingRule[]> =>
-  (await api.get<RoutingRule[]>(`/templates/${templateId}/routing-rules`)).data;
-
-export async function createRoutingRule(
-  templateId: string,
-  body: Record<string, unknown>,
-): Promise<RoutingRule> {
-  return (await api.post<RoutingRule>(`/templates/${templateId}/routing-rules`, body)).data;
-}
-
-export async function updateRoutingRule(
-  templateId: string,
-  ruleId: string,
-  body: Record<string, unknown>,
-): Promise<RoutingRule> {
-  return (await api.patch<RoutingRule>(`/templates/${templateId}/routing-rules/${ruleId}`, body)).data;
-}
-
-export async function deleteRoutingRule(templateId: string, ruleId: string): Promise<void> {
-  await api.delete(`/templates/${templateId}/routing-rules/${ruleId}`);
 }
 
 // --- fluxos declarativos (workflows) ---
@@ -266,26 +247,12 @@ export async function dismissWorkflowExecution(id: string): Promise<ActionExecut
   return (await api.post<ActionExecution>(`/workflows/executions/${id}/dismiss`)).data;
 }
 
-// --- inbox / kanban ---
-export const listSuggested = async (): Promise<Note[]> =>
-  (await api.get<Note[]>("/inbox/suggested", { params: { limit: 100 } })).data;
-
-export async function acceptSuggestion(
-  id: string,
-  body: { kanban_status?: string; due_date?: string | null; reminder_at?: string | null },
-): Promise<Note> {
-  return (await api.post<Note>(`/inbox/${id}/accept`, body)).data;
-}
-
-export async function discardSuggestion(id: string): Promise<Note> {
-  return (await api.post<Note>(`/inbox/${id}/discard`)).data;
-}
-
+// --- kanban de tarefas ---
 export const getBoard = async (): Promise<KanbanBoard> =>
   (await api.get<KanbanBoard>("/kanban")).data;
 
-export async function moveCard(id: string, kanban_status: string, due_date?: string | null): Promise<Note> {
-  return (await api.patch<Note>(`/kanban/${id}/move`, { kanban_status, due_date })).data;
+export async function moveCard(id: string, kanban_status: string, due_at?: string | null): Promise<TaskRead> {
+  return (await api.patch<TaskRead>(`/kanban/${id}/move`, { kanban_status, due_at })).data;
 }
 
 // --- segredos ---

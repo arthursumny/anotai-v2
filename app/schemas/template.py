@@ -5,9 +5,83 @@ from datetime import datetime
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
-ActionType = Literal["telegram", "whatsapp", "webhook", "mcp_tool", "email"]
+ActionType = Literal["telegram", "webhook", "mcp_tool", "email", "create_task"]
+
+
+class _ActionProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class EmailConfig(_ActionProviderConfig):
+    subject: StrictStr = Field(default="{title}", min_length=1, max_length=998)
+    body: StrictStr = Field(default="{body}", min_length=1, max_length=200000)
+    to: StrictStr | None = Field(default=None, min_length=1, max_length=320)
+
+
+class TaskConfig(_ActionProviderConfig):
+    title: StrictStr = Field(default="{title}", min_length=1, max_length=300)
+    summary: StrictStr = Field(default="{summary}", max_length=2000)
+    due_at: StrictStr | None = None
+
+
+class TelegramConfig(_ActionProviderConfig):
+    template: StrictStr = Field(default="{summary}", min_length=1)
+    message: StrictStr | None = None
+    chat_id: StrictStr | None = None
+    bot_token: StrictStr | None = None
+
+
+class WebhookConfig(_ActionProviderConfig):
+    url: StrictStr = Field(min_length=1)
+    method: Literal["POST", "PUT", "PATCH"] = "POST"
+    headers: dict[str, StrictStr] = Field(default_factory=dict)
+    body: dict[str, JsonValue] | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, value: str) -> str:
+        if not value.startswith(("https://", "http://")):
+            raise ValueError("Webhook exige URL HTTP")
+        return value
+
+
+class MCPToolConfig(_ActionProviderConfig):
+    server_id: StrictStr
+    tool_name: StrictStr | None = Field(default=None, min_length=1)
+    arguments_mapping: dict[str, JsonValue] = Field(default_factory=dict)
+    dynamic_llm_call: StrictBool = False
+
+    @field_validator("server_id")
+    @classmethod
+    def _server_uuid(cls, value: str) -> str:
+        uuid.UUID(value)
+        return value
+
+    @model_validator(mode="after")
+    def _tool_required(self):
+        if not self.dynamic_llm_call and self.tool_name is None:
+            raise ValueError("MCP exige tool_name ou dynamic_llm_call")
+        return self
+
+
+ACTION_CONFIG_MODELS = {
+    "email": EmailConfig,
+    "create_task": TaskConfig,
+    "telegram": TelegramConfig,
+    "webhook": WebhookConfig,
+    "mcp_tool": MCPToolConfig,
+}
 
 
 class ActionConfig(BaseModel):
@@ -15,7 +89,14 @@ class ActionConfig(BaseModel):
 
     type: ActionType
     config: dict[str, Any] = Field(default_factory=dict)
-    enabled: StrictBool = True
+    enabled: StrictBool = False
+    require_confirmation: StrictBool = False
+
+    @model_validator(mode="after")
+    def _validate_enabled_config(self):
+        if self.enabled:
+            ACTION_CONFIG_MODELS[self.type].model_validate(self.config)
+        return self
 
 
 class TemplateCreate(BaseModel):
@@ -111,58 +192,6 @@ class TemplateRead(BaseModel):
     created_at: datetime
 
 
-CaptureMode = Literal["intentional", "continuous"]
-
-
-class TemplateRoutingRuleCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    context: str | None = Field(default=None, max_length=120)
-    capture_mode: CaptureMode | None = None
-    priority: int = Field(default=100, ge=0, le=1000)
-    enabled: bool = True
-
-    @field_validator("context")
-    @classmethod
-    def _normalize_context(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        if not normalized:
-            return None
-        return normalized
-
-
-class TemplateRoutingRuleUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    context: str | None = Field(default=None, max_length=120)
-    capture_mode: CaptureMode | None = None
-    priority: int | None = Field(default=None, ge=0, le=1000)
-    enabled: bool | None = None
-
-    @field_validator("context")
-    @classmethod
-    def _normalize_context(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        if not normalized:
-            return None
-        return normalized
-
-
-class TemplateRoutingRuleRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    template_id: uuid.UUID
-    context: str | None
-    capture_mode: str | None
-    priority: int
-    enabled: bool
-    created_at: datetime
-    updated_at: datetime
 
 
 DraftKind = Literal["texto", "número", "data", "lista", "sim/não", "opções"]

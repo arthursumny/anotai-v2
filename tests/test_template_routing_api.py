@@ -1,4 +1,9 @@
-"""Template metadata/versioning, routing-rule ownership, and migration tests."""
+"""Template metadata/versioning, workspace locale, and migration coverage.
+
+The deterministic routing rules this file used to cover were removed: model
+selection is now done by the OpenAI router in ``app/services/router.py``, and
+``/api/v1/templates/{id}/routing-rules`` no longer exists.
+"""
 
 import importlib.metadata
 import importlib.util
@@ -40,19 +45,6 @@ def _template_payload(**updates):
     return payload
 
 
-async def _second_user(client):
-    email = f"second-{uuid.uuid4().hex}@example.com"
-    response = await client.post("/api/v1/auth/register", json={
-        "name": "Second user", "email": email, "password": "senha-forte-123",
-    })
-    assert response.status_code == 201, response.text
-    response = await client.post(
-        "/api/v1/auth/login", data={"username": email, "password": "senha-forte-123"},
-    )
-    assert response.status_code == 200, response.text
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
 async def test_template_metadata_and_version_increment_only_on_real_patch(client, auth_headers):
     headers, _user_id = auth_headers
     response = await client.post("/api/v1/templates", headers=headers, json=_template_payload())
@@ -77,80 +69,6 @@ async def test_template_metadata_and_version_increment_only_on_real_patch(client
     assert changed.status_code == 200, changed.text
     assert changed.json()["version"] == 2
     assert changed.json()["routing_description"] == "Use for reviewed meeting transcripts"
-
-
-async def test_routing_rule_crud_is_scoped_to_current_user_and_owned_template(client, auth_headers):
-    user_headers, _user_id = auth_headers
-    template_response = await client.post(
-        "/api/v1/templates", headers=user_headers, json=_template_payload(),
-    )
-    assert template_response.status_code == 201
-    template_id = template_response.json()["id"]
-
-    created = await client.post(
-        f"/api/v1/templates/{template_id}/routing-rules",
-        headers=user_headers,
-        json={"context": "meeting", "capture_mode": "intentional", "priority": 50},
-    )
-    assert created.status_code == 201, created.text
-    rule = created.json()
-    assert rule["template_id"] == template_id
-    assert rule["context"] == "meeting"
-    assert "user_id" not in rule and "workspace_id" not in rule
-
-    listed = await client.get(
-        f"/api/v1/templates/{template_id}/routing-rules", headers=user_headers,
-    )
-    assert listed.status_code == 200
-    assert [entry["id"] for entry in listed.json()] == [rule["id"]]
-
-    updated = await client.patch(
-        f"/api/v1/templates/{template_id}/routing-rules/{rule['id']}",
-        headers=user_headers, json={"enabled": False, "priority": 10},
-    )
-    assert updated.status_code == 200
-    assert updated.json()["enabled"] is False
-    assert updated.json()["priority"] == 10
-
-    other_headers = await _second_user(client)
-    other_list = await client.get(
-        f"/api/v1/templates/{template_id}/routing-rules", headers=other_headers,
-    )
-    assert other_list.status_code == 404
-    other_patch = await client.patch(
-        f"/api/v1/templates/{template_id}/routing-rules/{rule['id']}",
-        headers=other_headers, json={"enabled": True},
-    )
-    assert other_patch.status_code == 404
-    other_template = await client.post(
-        f"/api/v1/templates/{template_id}/routing-rules",
-        headers=other_headers, json={"priority": 1},
-    )
-    assert other_template.status_code == 404
-
-    deleted = await client.delete(
-        f"/api/v1/templates/{template_id}/routing-rules/{rule['id']}", headers=user_headers,
-    )
-    assert deleted.status_code == 204
-    assert (await client.get(
-        f"/api/v1/templates/{template_id}/routing-rules", headers=user_headers,
-    )).json() == []
-
-
-async def test_routing_rule_rejects_client_workspace_and_invalid_values(client, auth_headers):
-    headers, _user_id = auth_headers
-    template = (await client.post(
-        "/api/v1/templates", headers=headers, json=_template_payload(),
-    )).json()
-    path = f"/api/v1/templates/{template['id']}/routing-rules"
-    forged = await client.post(path, headers=headers, json={
-        "workspace_id": str(uuid.uuid4()), "priority": 10,
-    })
-    assert forged.status_code == 422
-    bad_priority = await client.post(path, headers=headers, json={"priority": 1001})
-    assert bad_priority.status_code == 422
-    bad_context = await client.post(path, headers=headers, json={"context": "x" * 121})
-    assert bad_context.status_code == 422
 
 
 def test_workspace_iana_timezone_defaults_and_validation():

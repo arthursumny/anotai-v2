@@ -23,10 +23,22 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     OPENAI_API_KEY: str = ""
-    OPENAI_STT_MODEL: str = "whisper-1"
     OPENAI_ROUTER_MODEL: str = "gpt-4o-mini"
     OPENAI_EXTRACTOR_MODEL: str = "gpt-4o"
-    STT_PROVIDER: Literal["openai", "fake"] = "openai"
+    OPENAI_TRANSCRIPT_CHUNK_CHARS: int = Field(default=24000, ge=1000, le=64000)
+    STT_PROVIDER: Literal["soniox", "fake"] = "soniox"
+    SONIOX_API_KEY: str = ""
+    SONIOX_STT_MODEL: str = "stt-async-v5"
+    SONIOX_API_BASE_URL: str = "https://api.soniox.com"
+    SONIOX_STT_TIMEOUT_SECONDS: float = Field(default=900, gt=0)
+    SONIOX_STT_POLL_INTERVAL_SECONDS: float = Field(default=1, gt=0)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = Field(default=587, ge=1, le=65535)
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_TLS: Literal["starttls", "ssl", "none"] = "starttls"
+    SMTP_TIMEOUT_SECONDS: float = Field(default=15, gt=0)
 
     ROUTER_CONFIDENCE_THRESHOLD: float = 0.6
     FOLLOW_UP_DELAY_HOURS: int = Field(default=24, ge=1, le=168)

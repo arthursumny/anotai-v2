@@ -1,6 +1,6 @@
-"""AnotAI — worker ARQ: pipeline STT -> router/extractor/contínuo -> dispatcher + cron de lembretes."""
+"""AnotAI — worker ARQ: pipeline STT -> router/extractor -> dispatcher + cron de lembretes."""
 
-import asyncio
+import anyio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -22,29 +22,21 @@ from app.models.automation_settings import AutomationSettings
 from app.models.audit_event import AuditEvent
 from app.models.gmail_watch_state import GmailWatchState
 from app.models.integration_connection import IntegrationConnection
-from app.models.note import CaptureMode, KanbanColumn, Note, NoteStatus
+from app.models.note import Note, NoteStatus
 from app.models.source_policy import SourceMonitoringPolicy
-from app.models.template import Template
-from app.models.template_routing_rule import TemplateRoutingRule
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMembership
 from app.services.audio_check import check_audible
-from app.services.continuous_extractor import ContinuousExtractionError, analyze_continuous_chunk
-from app.services.dispatcher import build_secret_scope, dispatch_actions, load_user_secrets
-from app.services.event_ingestion import EventCandidate, ingest as ingest_event
-from app.services.extractor import ExtractionError, extract_structured
-from app.services.general_note import GeneralNoteError, generate_general_note
+from app.services.dispatcher import build_secret_scope, load_user_secrets
+from app.services.note_pipeline import process_transcription
 from app.services.reminder_scheduler import (
     process_followup_due,
     process_reminder_due,
     reconcile_due_items as reconcile_due_items_in_session,
 )
 from app.services.conversation_intelligence import materialize_due_conversation_followups
-from app.services.router import RouterRule, route_transcription
 from app.services.stt import STTError, get_stt_provider
-from app.services.document_pipeline import process_generated_note
 from app.services.document_recovery import reconcile_missing_documents
-from app.services.workflow_engine import emit_trigger
 from app.services.action_executor import process_pending_actions
 from app.services.notification_prefs import should_notify
 from app.services.gmail_ingress import GmailSourceProvider
@@ -56,99 +48,6 @@ from app.services.action_hygiene import cleanup_action_executions
 logger = logging.getLogger("anotai.worker")
 
 
-def _parse_dt(value: Any) -> datetime | None:
-    """ISO8601 (com ou sem Z) → datetime UTC. None se ausente/inválido."""
-    if not value or not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text[-1] in ("Z", "z"):
-        text = text[:-1] + "+00:00"
-    try:
-        if len(text) == 10:
-            dt = datetime.fromisoformat(f"{text}T09:00:00")
-        else:
-            dt = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        try:
-            dt = dt.replace(tzinfo=ZoneInfo(settings.DEFAULT_TIMEZONE))
-        except Exception:
-            dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _extract_task_items(structured: dict[str, Any]) -> list[Any]:
-    """Encontra listas de tarefas explicitamente produzidas pela IA."""
-    for key, value in structured.items():
-        if key.strip().casefold() in {"tarefas", "tasks", "proximas_acoes", "next_actions"} and isinstance(value, list):
-            return value[:10]
-    return []
-
-
-async def _create_kanban_tasks(note: Note, structured: dict[str, Any], session: Any) -> list[str]:
-    """Transforma tarefas extraídas em cartões, uma vez por nota processada."""
-    existing_ids = structured.get("kanban_task_ids")
-    if isinstance(existing_ids, list) and existing_ids:
-        return [str(item) for item in existing_ids]
-    tasks = _extract_task_items(structured)
-    card_ids: list[str] = []
-    task_reminders: list[datetime] = []
-    for index, item in enumerate(tasks):
-        if isinstance(item, str):
-            title = item.strip()
-            due_value = None
-            reminder_value = None
-        elif isinstance(item, dict):
-            title = str(item.get("title") or item.get("tarefa") or item.get("task") or item.get("nome") or "").strip()
-            due_value = item.get("due_date") or item.get("prazo") or item.get("deadline")
-            reminder_value = item.get("reminder_at") or item.get("lembrete")
-        else:
-            continue
-        if not title:
-            continue
-        due_date = _parse_dt(due_value)
-        reminder_at = _parse_dt(reminder_value)
-        if due_date is not None:
-            if reminder_at is None and due_date > datetime.now(timezone.utc):
-                reminder_at = due_date - timedelta(minutes=30)
-        if reminder_at is not None:
-            task_reminders.append(reminder_at)
-        card = Note(
-            user_id=note.user_id,
-            title=title[:300],
-            raw_transcription=note.raw_transcription,
-            structured_data={
-                "description": title,
-                "source_note_id": str(note.id),
-                "task_index": index,
-            },
-            status=NoteStatus.PROCESSED,
-            capture_mode=note.capture_mode,
-            kanban_status=KanbanColumn.TODO.value,
-            due_date=due_date,
-            reminder_at=reminder_at,
-        )
-        session.add(card)
-        await session.flush()
-        card_ids.append(str(card.id))
-    if card_ids:
-        note.structured_data = {**structured, "kanban_task_ids": card_ids}
-        # Cartões individuais no quadro; o texto completo fica na nota de origem.
-        note.kanban_status = None
-        note_reminder = _ensure_aware(note.reminder_at)
-        if note_reminder and any(
-            abs((note_reminder - _ensure_aware(task_reminder)).total_seconds()) <= 300
-            for task_reminder in task_reminders
-        ):
-            # Evita avisos duplicados quando nota e cartão representam a mesma tarefa.
-            note.reminder_at = None
-        session.add(note)
-    return card_ids
-
-
 def _ensure_aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -157,331 +56,48 @@ def _ensure_aware(value: datetime | None) -> datetime | None:
     return value
 
 
-async def _process_continuous(
-    session: Any, note: Note, uid: uuid.UUID, transcription: str
-) -> dict:
-    """Ramo Always-On: analisa o chunk e cria uma Note `suggested` por item.
-
-    Sem itens acionáveis (ou LLM indisponível): remove a nota-portadora para
-    não poluir a interface.
-    """
-    try:
-        items = await analyze_continuous_chunk(transcription, {"user_id": str(uid)})
-    except ContinuousExtractionError as exc:
-        logger.warning("Extrator contínuo falhou p/ nota %s: %s", note.id, exc)
-        items = []
-
-    await session.delete(note)
-    created_ids: list[str] = []
-    for item in items:
-        suggestion = Note(
-            user_id=uid,
-            title=str(item.get("title", ""))[:300],
-            raw_transcription=transcription,
-            structured_data={"description": item.get("description", "")},
-            status=NoteStatus.SUGGESTED,
-            capture_mode=CaptureMode.CONTINUOUS.value,
-            suggested_action=str(item.get("suggested_action", "Criar Tarefa no Kanban"))[:200],
-            due_date=_parse_dt(item.get("suggested_due_date")),
-            reminder_at=_parse_dt(item.get("suggested_reminder_at")),
-        )
-        session.add(suggestion)
-        # flush por item para obter os ids no retorno
-        await session.flush()
-        created_ids.append(str(suggestion.id))
-    await session.commit()
-    return {"ok": True, "status": "continuous", "suggestions": created_ids}
-
-
-async def _ingest_audio_transcription(
-    session: Any, note: Note, user_id: uuid.UUID, content: str, capture_mode: str
-) -> None:
-    """Best-effort normalized event for audio; source identity comes from DB only."""
-    try:
-        user = await session.get(User, user_id)
-        workspace_id = user.workspace_id if user is not None else None
-        if workspace_id is None:
-            return
-        occurred_at = note.created_at
-        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
-            occurred_at = datetime.now(timezone.utc)
-        await ingest_event(
-            EventCandidate(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                source="audio",
-                type="AUDIO_TRANSCRIBED",
-                occurred_at=occurred_at,
-                content=content,
-                external_id=str(note.id),
-                capture_mode=capture_mode,
-            ),
-            session,
-        )
-    except Exception:  # noqa: BLE001 — event capture must not break legacy processing
-        logger.warning("Áudio não foi adicionado ao histórico de eventos")
-
-
-async def _workspace_routing_rules(
-    session: Any, user_id: uuid.UUID, capture_mode: str
-) -> tuple[uuid.UUID | None, list[RouterRule]]:
-    """Load only enabled rules scoped to the user's verified workspace membership."""
-    user = await session.get(User, user_id)
-    workspace_id = user.workspace_id if user is not None else None
-    if workspace_id is None:
-        return None, []
-    membership_id = (await session.exec(
-        select(WorkspaceMembership.id).where(
-            WorkspaceMembership.workspace_id == workspace_id,
-            WorkspaceMembership.user_id == user_id,
-        )
-    )).first()
-    if membership_id is None:
-        return None, []
-    rows = (await session.exec(
-        select(TemplateRoutingRule).where(
-            TemplateRoutingRule.user_id == user_id,
-            TemplateRoutingRule.workspace_id == workspace_id,
-            TemplateRoutingRule.enabled == True,  # noqa: E712
-        )
-        .order_by(TemplateRoutingRule.created_at.asc(), TemplateRoutingRule.id.asc())
-    )).all()
-    return workspace_id, [
-        RouterRule(
-            template_id=rule.template_id,
-            priority=rule.priority,
-            workspace=workspace_id,
-            context=rule.context,
-            capture_mode=rule.capture_mode,
-        )
-        for rule in rows
-    ]
-
-
-async def _process_document_safely(session: Any, note: Note, user_id: uuid.UUID) -> None:
-    """Materialize after the note commit without jeopardizing legacy note flow."""
-    document = None
-    try:
-        document = await process_generated_note(session, note.id, user_id)
-        await session.commit()
-    except Exception:  # noqa: BLE001 — document/intelligence is best effort
-        logger.warning("Documento gerado não foi persistido para a nota %s", note.id)
-        try:
-            await session.rollback()
-            await session.refresh(note)
-        except Exception:
-            logger.warning("Nota %s não pôde ser recarregada após falha documental", note.id)
-        return
-    if document is None:
-        return
-    try:
-        await emit_trigger(
-            session,
-            document.workspace_id,
-            document.user_id,
-            "DOCUMENT_GENERATED",
-            source_id=document.id,
-            context={"source": "audio", "event_type": "DOCUMENT_GENERATED"},
-        )
-        await session.commit()
-    except Exception:  # noqa: BLE001 — workflow preparation can't undo saved note/document
-        logger.warning("Workflow documental não pôde ser preparado para a nota %s", note.id)
-        try:
-            await session.rollback()
-            await session.refresh(note)
-        except Exception:
-            logger.warning("Nota %s não pôde ser recarregada após falha de workflow", note.id)
-
-
 async def process_audio_job(
-    ctx: dict, note_id: str, audio_path: str, user_id: str, capture_mode: str = "intentional"
+    ctx: dict, note_id: str, audio_path: str, user_id: str,
 ) -> dict:
-    """Job ARQ. Retorna resumo; nunca levanta (falhas ficam na Note/ExecutionLog)."""
+    """Transcribe once, save a complete document, then prepare its durable actions."""
     path = Path(audio_path)
-    mode = (capture_mode or "intentional").strip().lower()
-    if mode not in (CaptureMode.INTENTIONAL.value, CaptureMode.CONTINUOUS.value):
-        mode = CaptureMode.INTENTIONAL.value
     try:
-        nid = uuid.UUID(note_id)
-        uid = uuid.UUID(user_id)
+        nid, uid = uuid.UUID(note_id), uuid.UUID(user_id)
     except ValueError:
-        logger.error("IDs inválidos: note_id=%s user_id=%s", note_id, user_id)
         return {"ok": False, "error": "IDs inválidos"}
-
     async with async_session_factory() as session:
         note = await session.get(Note, nid)
         if note is None or note.user_id != uid:
-            logger.error("Nota %s não encontrada ou não pertence ao usuário", note_id)
             return {"ok": False, "error": "Nota não encontrada"}
         try:
-            # 0. Barreira de audibilidade (defesa em profundidade: o endpoint
-            #    já filtra, mas jobs antigos/diretos podem trazer silêncio).
-            audible, reason = await asyncio.to_thread(check_audible, path)
-            if not audible:
-                raise STTError(f"Áudio sem som detectado ({reason}); nada enviado ao Whisper")
-
-            # 1. STT
-            stt = get_stt_provider()
-            transcription = await stt.transcribe(path)
-            note.raw_transcription = transcription
-            note.capture_mode = mode
-            await _ingest_audio_transcription(session, note, uid, transcription, mode)
-
-            # 1b. Ramo contínuo: extrator semântico → sugestões (sem router/templates)
-            if mode == CaptureMode.CONTINUOUS.value:
-                return await _process_continuous(session, note, uid, transcription)
-
-            # 2. Router — templates do usuário
-            result = await session.exec(select(Template).where(Template.user_id == uid))
-            templates = list(result.all())
-            workspace_id, routing_rules = await _workspace_routing_rules(session, uid, mode)
-            if workspace_id is None:
-                # Workspace-less accounts retain the exact legacy routing path.
-                routing = await route_transcription(transcription, templates)
-            else:
-                routing = await route_transcription(
-                    transcription,
-                    templates,
-                    routing_rules,
-                    workspace=workspace_id,
-                    capture_mode=mode,
-                )
-
-            if not routing.matched or routing.template_id is None:
-                # Sem template: nota geral interpretada pela IA (nunca "sem match").
-                note.template_id = None
-                note.status = NoteStatus.PROCESSED
-                try:
-                    general = await generate_general_note(transcription, {"user_id": str(uid)})
-                except GeneralNoteError as exc:
-                    logger.warning("Nota geral curta p/ nota %s: %s", note.id, exc)
-                    general = {
-                        "title": transcription.strip()[:80] or "Nota de voz",
-                        "body": transcription.strip(),
-                        "tasks": [],
-                        "due_date": None,
-                        "reminder_at": None,
-                        "send_to_kanban": False,
-                    }
-                note.title = str(general.get("title", "") or "Nota de voz")[:300]
-                note.structured_data = {
-                    "tipo": "nota_geral",
-                    "nota": general.get("body", ""),
-                    "tarefas": general.get("tasks", []),
-                }
-                note.due_date = _parse_dt(general.get("due_date"))
-                note.reminder_at = _parse_dt(general.get("reminder_at"))
-                if note.reminder_at is not None:
-                    note.reminder_sent = False
-                note.kanban_status = (
-                    KanbanColumn.TODO.value if general.get("send_to_kanban") else None
-                )
-                if _extract_task_items(note.structured_data):
-                    await _create_kanban_tasks(note, note.structured_data, session)
+            if not note.raw_transcription.strip():
+                audible, reason = await anyio.to_thread.run_sync(check_audible, path)
+                if not audible:
+                    raise STTError(f"Áudio sem som aproveitável: {reason}")
+                note.raw_transcription = await get_stt_provider().transcribe(path)
                 session.add(note)
                 await session.commit()
-                await _process_document_safely(session, note, uid)
-                return {"ok": True, "status": "general", "reason": routing.reason}
-
-            template = await session.get(Template, routing.template_id)
-            if template is None:
-                # Template removido entre router e extração: cai na nota geral.
-                note.template_id = None
-                note.status = NoteStatus.PROCESSED
-                try:
-                    general = await generate_general_note(transcription, {"user_id": str(uid)})
-                except GeneralNoteError:
-                    general = {
-                        "title": transcription.strip()[:80] or "Nota de voz",
-                        "body": transcription.strip(),
-                        "tasks": [],
-                        "due_date": None,
-                        "reminder_at": None,
-                        "send_to_kanban": False,
-                    }
-                note.title = str(general.get("title", "") or "Nota de voz")[:300]
-                note.structured_data = {
-                    "tipo": "nota_geral",
-                    "nota": general.get("body", ""),
-                    "tarefas": general.get("tasks", []),
-                }
-                note.due_date = _parse_dt(general.get("due_date"))
-                note.reminder_at = _parse_dt(general.get("reminder_at"))
-                if note.reminder_at is not None:
-                    note.reminder_sent = False
-                note.kanban_status = (
-                    KanbanColumn.TODO.value if general.get("send_to_kanban") else None
-                )
-                if _extract_task_items(note.structured_data):
-                    await _create_kanban_tasks(note, note.structured_data, session)
-                session.add(note)
-                await session.commit()
-                await _process_document_safely(session, note, uid)
-                return {"ok": True, "status": "general", "reason": "template removido"}
-
-            # 3. Extração
-            try:
-                structured = await extract_structured(template, transcription)
-            except ExtractionError as exc:
-                note.template_id = template.id
-                note.structured_data = None
-                note.status = NoteStatus.PENDING_REVIEW
-                session.add(note)
-                session.add(
-                    ExecutionLog(
-                        note_id=note.id,
-                        action_type="extraction",
-                        status=ExecutionStatus.FAILED,
-                        payload={"template_id": str(template.id)},
-                        error_message=str(exc)[:4000],
-                    )
-                )
-                await session.commit()
-                return {"ok": False, "status": "extraction_failed", "error": str(exc)}
-
-            note.template_id = template.id
-            note.structured_data = structured
-            note.status = NoteStatus.PROCESSED
-            if _extract_task_items(structured):
-                await _create_kanban_tasks(note, structured, session)
-            session.add(note)
-            await session.commit()
+            await process_transcription(session, note)
+            redis = ctx.get("redis")
+            if redis is not None:
+                await redis.enqueue_job("run_pending_actions_job")
+            return {"ok": True, "status": "processed" if note.template_id else "general"}
+        except Exception as exc:
+            # ARQ boundary: persist a visible error without inventing a document.
+            logger.exception("Falha no processamento da nota %s", note_id)
+            await session.rollback()
             await session.refresh(note)
-
-            await _process_document_safely(session, note, uid)
-
-            # 4. Dispatcher (persiste os próprios logs)
-            logs = await dispatch_actions(note, template, session)
-            ok_actions = sum(1 for lg in logs if lg.status == ExecutionStatus.SUCCESS)
-            return {"ok": True, "status": "processed", "actions_ok": ok_actions, "actions_total": len(logs)}
-        except Exception as exc:  # noqa: BLE001 — job nunca deve quebrar o worker
-            logger.exception("Falha no job da nota %s", note_id)
-            try:
-                if not (note.raw_transcription or "").strip():
-                    # Sem transcrição não há nota: apaga em vez de poluir a lista.
-                    await session.delete(note)
-                    await session.commit()
-                    return {"ok": False, "error": str(exc), "discarded": True}
+            if not note.body:
                 note.status = NoteStatus.PENDING_REVIEW
                 session.add(note)
-                session.add(
-                    ExecutionLog(
-                        note_id=note.id,
-                        action_type="pipeline",
-                        status=ExecutionStatus.FAILED,
-                        payload={},
-                        error_message=str(exc)[:4000],
-                    )
-                )
-                await session.commit()
-            except Exception:
-                logger.exception("Falha ao persistir erro do job %s", note_id)
+            session.add(ExecutionLog(
+                note_id=note.id, action_type="pipeline", status=ExecutionStatus.FAILED,
+                payload={}, error_message=str(exc)[:4000],
+            ))
+            await session.commit()
             return {"ok": False, "error": str(exc)}
         finally:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            path.unlink(missing_ok=True)
 
 
 async def _send_reminder_telegram(note: Note, session: Any) -> dict[str, Any]:
@@ -512,9 +128,9 @@ async def _send_reminder_telegram(note: Note, session: Any) -> dict[str, Any]:
 async def check_scheduled_reminders(ctx: dict) -> dict:
     """Cron ARQ (a cada 2 min): dispara lembretes vencidos ainda não enviados.
 
-    Alvos: `reminder_at <= now`, `status == processed`, `kanban != done`,
-    `reminder_sent == False`. Sucesso marca `reminder_sent`; falha mantém
-    para nova tentativa no próximo ciclo. Nunca levanta.
+    Alvos: `reminder_at <= now`, `status == processed`, `reminder_sent == False`.
+    Sucesso marca `reminder_sent`; falha mantém para nova tentativa no próximo
+    ciclo. Nunca levanta.
     """
     now = datetime.now(timezone.utc)
     sent, failed, skipped = 0, 0, 0
@@ -532,9 +148,6 @@ async def check_scheduled_reminders(ctx: dict) -> dict:
             logger.exception("Falha ao buscar lembretes")
             return {"ok": False, "error": "query"}
         for note in candidates:
-            if note.kanban_status == KanbanColumn.DONE.value:
-                skipped += 1
-                continue
             moment = _ensure_aware(note.reminder_at)
             if moment is None or moment > now:
                 skipped += 1
@@ -800,6 +413,7 @@ async def gmail_history_job(ctx: dict, connection_id: str, history_id: str | Non
 
 
 class WorkerSettings:
+    job_timeout = 1800
     functions = [
         process_audio_job,
         gmail_history_job,

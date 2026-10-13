@@ -141,27 +141,24 @@ async def test_no_external_policy_is_opt_in_and_blocked_content_is_not_stored(db
     audio = await ingest(_candidate(user, workspace, source="audio", external_id=None), db_session)
     assert audio is not None
     assert audio.content == "sensitive message body"
-    assert audio.metadata_json["capture_mode"] is None
+    assert "capture_mode" not in audio.metadata_json
     await _policy(db_session, user, workspace)
     non_audio = await ingest(_candidate(user, workspace), db_session)
     assert non_audio is not None and "capture_mode" not in non_audio.metadata_json
 
 
-async def test_capture_mode_is_validated_and_only_stored_for_audio(db_session):
+async def test_capture_mode_is_not_part_of_event_ingestion(db_session):
     user, workspace = await _identity(db_session)
-    valid = await ingest(
-        _candidate(user, workspace, source="audio", external_id=None, capture_mode="continuous"),
-        db_session,
+    event = await ingest(
+        _candidate(user, workspace, source="audio", external_id=None), db_session,
     )
-    assert valid is not None and valid.metadata_json["capture_mode"] == "continuous"
+    assert event is not None
+    assert "capture_mode" not in event.metadata_json
 
-    with pytest.raises(ValueError, match="capture_mode"):
-        await ingest(
-            _candidate(user, workspace, source="audio", external_id=None, capture_mode="automatic"),
-            db_session,
-        )
-    with pytest.raises(ValueError, match="só é permitido"):
-        await ingest(_candidate(user, workspace, capture_mode="intentional"), db_session)
+    # O campo saiu do contrato do candidato: enviá-lo é erro de construção,
+    # não um valor validado/armazenado.
+    with pytest.raises(TypeError):
+        _candidate(user, workspace, capture_mode="continuous")
 
 
 async def test_gmail_policy_filters_labels_and_senders(db_session):

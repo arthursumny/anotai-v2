@@ -8,10 +8,13 @@ os.environ.setdefault("STT_PROVIDER", "fake")
 os.environ.setdefault("USER_SECRET_ENCRYPTION_KEY", "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
 
 import uuid
+import json
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+import httpx
+from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
@@ -19,8 +22,26 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 import app.models  # noqa: F401 — registra o metadata
 import app.worker as worker
+import app.services.extractor as extractor
+import app.services.router as router
+from app.core.config import settings
 from app.core.database import get_session
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def audio_upload_dir(tmp_path, monkeypatch):
+    """AUDIO_UPLOAD_DIR precisa ser gravável por qualquer usuário de teste.
+
+    O default (`/tmp/anotai-audio`) pode pertencer a outro usuário (ex.: root),
+    quebrando os testes de upload com PermissionError. As settings são lidas uma
+    única vez via `get_settings()` (lru_cache), então aponta o objeto já
+    importado para um diretório temporário criado pelo pytest.
+    """
+    upload = tmp_path / "audio-uploads"
+    upload.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(settings, "AUDIO_UPLOAD_DIR", str(upload))
+    return upload
 
 
 @pytest_asyncio.fixture
@@ -88,3 +109,39 @@ def worker_db(monkeypatch, db_session: AsyncSession):
     """Sessão de teste plugada no worker (jobs sem Postgres/Redis reais)."""
     monkeypatch.setattr(worker, "async_session_factory", _SessionFactory(db_session))
     return db_session
+
+
+@pytest.fixture
+def openai_stub(monkeypatch):
+    """Exercise the real OpenAI SDK against deterministic HTTP responses."""
+    monkeypatch.setattr(extractor.settings, "OPENAI_API_KEY", "test-key")
+
+    def install(*payloads):
+        remaining = iter(payloads)
+        requests = []
+
+        def handle(request):
+            requests.append(json.loads(request.content))
+            payload = next(remaining)
+            if isinstance(payload, httpx.Response):
+                return payload
+            return httpx.Response(200, json={
+                "id": "chat-test", "object": "chat.completion", "created": 1,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": json.dumps(payload), "refusal": None},
+                }],
+            })
+
+        def client(**kwargs):
+            return AsyncOpenAI(
+                **kwargs, max_retries=0,
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+            )
+
+        monkeypatch.setattr(extractor, "AsyncOpenAI", client)
+        monkeypatch.setattr(router, "AsyncOpenAI", client)
+        return requests
+
+    return install

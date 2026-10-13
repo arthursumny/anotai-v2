@@ -8,9 +8,7 @@ export function StatusBadge({ status, templateId }: { status: string; templateId
   const isGeneral = status === "processed" && templateId === null;
   const labels: Record<string, string> = {
     processed: isGeneral ? "Nota geral" : "Organizada",
-    no_match: "Nota geral",
     pending_review: "Em análise",
-    suggested: "Sugestão",
     discarded: "Descartada",
   };
   const cls = isGeneral ? "general" : status;
@@ -41,12 +39,12 @@ export default function Notes() {
 
   const q = query.trim().toLowerCase();
   const filtered = notes.filter((n) => {
-    const matchesQuery = !q || `${n.title ?? ""} ${n.raw_transcription ?? ""}`.toLowerCase().includes(q);
-    const isGeneral = n.status === "no_match" || (n.status === "processed" && !n.template_id);
+    const matchesQuery = !q || `${n.title} ${n.summary} ${n.body} ${n.raw_transcription}`.toLowerCase().includes(q);
+    const isGeneral = n.status === "processed" && !n.template_id;
     const matchesFilter = filter === "all"
       || (filter === "general" && isGeneral)
       || (filter === "structured" && Boolean(n.template_id))
-      || (filter === "review" && (n.status === "pending_review" || n.status === "suggested"))
+      || (filter === "review" && n.status === "pending_review")
       || (filter === "discarded" && n.status === "discarded");
     return matchesQuery && matchesFilter;
   });
@@ -96,10 +94,10 @@ export default function Notes() {
           <div className="card hoverable">
             <StatusBadge status={n.status} templateId={n.template_id} />
             <div style={{ marginTop: 6, fontWeight: n.title ? 700 : 400 }}>
-              {n.title || n.raw_transcription || "Áudio em processamento…"}
+              {n.title || (n.status === "pending_review" ? "Geração pendente" : "Nota sem título")}
             </div>
-            {n.title && n.raw_transcription && (
-              <div className="muted" style={{ marginTop: 4 }}>{n.raw_transcription.slice(0, 140)}</div>
+            {n.summary && (
+              <div className="muted" style={{ marginTop: 4 }}>{n.summary.slice(0, 140)}</div>
             )}
             <div className="muted" style={{ marginTop: 6 }}>{new Date(n.created_at).toLocaleString()}</div>
           </div>

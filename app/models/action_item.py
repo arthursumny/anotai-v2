@@ -30,6 +30,10 @@ class Task(SQLModel, table=True):
     summary: str = Field(default="", sa_column=Column(Text(), nullable=False))
     confidence: float | None = Field(default=None, sa_column=Column(Float(), nullable=True))
     status: str = Field(default="open", max_length=30)
+    kanban_status: str = Field(default="todo", max_length=30)
+    source_note_id: uuid.UUID | None = Field(default=None, sa_column=Column(
+        Uuid(), ForeignKey("notes.id", ondelete="SET NULL"), nullable=True, index=True,
+    ))
     due_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True, index=True))
     remind_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True, index=True))
     snoozed_until: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True, index=True))

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { apiError, getBoard, moveCard } from "../api";
-import type { KanbanBoard, Note } from "../types";
+import type { KanbanBoard, TaskRead } from "../types";
 import Icon from "../components/Icon";
 
 type ColumnKey = keyof KanbanBoard;
@@ -35,7 +35,7 @@ export default function Kanban() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const moveTo = async (note: Note, target: ColumnKey) => {
+  const moveTo = async (note: TaskRead, target: ColumnKey) => {
     if ((note.kanban_status ?? "todo") === target || busy) return;
     setError(null);
     setBusy(note.id);
@@ -111,12 +111,13 @@ export default function Kanban() {
                   onDragEnd={() => { setDragging(null); setDropTarget(null); }}
                 >
                   <div className="kanban-card-title">
-                    <b>{note.title || "Nota sem título"}</b>
+                    <b>{note.title || "Tarefa sem título"}</b>
                     <span className="drag-grip" aria-hidden="true"><Icon name="grip" size={17} /></span>
                   </div>
-                  <p className="kanban-date"><Icon name="calendar" size={15} /> {fmtDue(note.due_date)}</p>
-                  {note.reminder_at && !note.reminder_sent && (
-                    <p className="kanban-date"><Icon name="clock" size={15} /> Lembrete {new Date(note.reminder_at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })}</p>
+                  {note.summary && <p className="muted">{note.summary}</p>}
+                  <p className="kanban-date"><Icon name="calendar" size={15} /> {fmtDue(note.due_at)}</p>
+                  {note.remind_at && (
+                    <p className="kanban-date"><Icon name="clock" size={15} /> Lembrete {new Date(note.remind_at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })}</p>
                   )}
                   <div className="kanban-card-actions">
                     <label className="kanban-move-label">
@@ -125,7 +126,7 @@ export default function Kanban() {
                         {COLS.map((option) => <option value={option.key} key={option.key}>{option.title}</option>)}
                       </select>
                     </label>
-                    <Link to={`/notas/${note.id}`} className="btn btn-secondary">Abrir nota</Link>
+                    {note.source_note_id && <Link to={`/notas/${note.source_note_id}`} className="btn btn-secondary">Abrir nota</Link>}
                   </div>
                 </article>
               ))}

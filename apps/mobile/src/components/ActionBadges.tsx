@@ -3,10 +3,10 @@ import { StyleSheet, Text, View } from "react-native";
 
 const LABELS: Record<string, string> = {
   telegram: "Telegram",
-  whatsapp: "WhatsApp",
   webhook: "Webhook",
   mcp_tool: "MCP",
   email: "E-mail",
+  create_task: "Criar tarefa",
 };
 
 export default function ActionBadges({ types }: { types: string[] }): JSX.Element {

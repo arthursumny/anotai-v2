@@ -6,17 +6,20 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlmodel import select
 
-import app.services.document_pipeline as document_pipeline
 import app.services.document_recovery as document_recovery
+import app.services.note_pipeline as note_pipeline
 import app.worker as worker
 from app.models.action_execution import ActionExecution
 from app.models.automation_settings import AutomationMode, AutomationSettings
 from app.models.generated_document import GeneratedDocument
 from app.models.normalized_event import NormalizedEvent
 from app.models.note import Note, NoteStatus
+from app.models.template import Template
 from app.models.user import User
 from app.models.workflow import Workflow, WorkflowExecution, WorkflowStep
 from app.models.workspace import Workspace, WorkspaceMembership
+from app.services.extractor import GeneratedNote
+from app.services.router import RouterResult
 
 
 async def _runtime_identity(session, *, mode: AutomationMode | None = None):
@@ -77,46 +80,85 @@ def _install_worker_stt(monkeypatch, transcription: str):
     monkeypatch.setattr(worker, "check_audible", lambda _path: (True, "ok"))
 
 
-async def _general_result(_transcription, _context):
-    return {
-        "title": "Runtime note",
-        "body": "A safe summary",
-        "tasks": [],
-        "due_date": None,
-        "reminder_at": None,
-        "send_to_kanban": False,
-    }
+async def _route_to(template_id):
+    return RouterResult(template_id, 0.9, "forced for test")
+
+
+async def _template_result(_transcription, _template=None):
+    return GeneratedNote(
+        title="Runtime note",
+        body="A safe summary",
+        summary="Runtime summary",
+        data={"tipo": "nota_geral"},
+    )
 
 
 @pytest.mark.parametrize(
-    "mode,expected_status",
-    [("suggestive", "awaiting_confirmation"), ("automatic", "pending")],
+    "mode,require_confirmation,expected_status",
+    [
+        ("suggestive", True, "awaiting_confirmation"),
+        ("automatic", False, "pending"),
+    ],
 )
-async def test_audio_document_trigger_prepares_idempotent_workflow_action(
-    worker_db, tmp_path, monkeypatch, mode, expected_status
+async def test_audio_document_prepares_idempotent_template_action(
+    worker_db, tmp_path, monkeypatch, mode, require_confirmation, expected_status
 ):
-    workspace, user, workflow, note = await _runtime_identity(worker_db, mode=mode)
+    """A processed recording prepares its template's actions exactly once, durably.
+
+    The automations that fire are the **template's own actions** (email/task/
+    telegram/webhook/mcp), prepared by ``prepare_template_actions``. The
+    multi-step ``Workflow`` engine is CRUD plus confirm/dismiss only: nothing in
+    production calls ``emit_trigger``, so a ``DOCUMENT_GENERATED`` workflow
+    trigger produces **no** ``WorkflowExecution`` row here. That is asserted
+    below so the gap stays visible instead of silently disappearing.
+    """
+    workspace, user, _workflow, note = await _runtime_identity(worker_db, mode=mode)
+    template = Template(
+        user_id=user.id,
+        title="Meeting notes",
+        purpose="Registrar decisões",
+        semantic_trigger="reunião",
+        example_output="## Decisões",
+        output_schema={"type": "object"},
+        actions=[{
+            "type": "create_task",
+            "enabled": True,
+            "require_confirmation": require_confirmation,
+            "config": {"title": "Review generated note", "summary": ""},
+        }],
+    )
+    worker_db.add(template)
+    await worker_db.commit()
+
     _install_worker_stt(monkeypatch, "audio content")
-    monkeypatch.setattr(worker, "generate_general_note", _general_result)
-    classify = AsyncMock(return_value=[])
-    monkeypatch.setattr(document_pipeline, "classify_event", classify)
+    monkeypatch.setattr(
+        note_pipeline, "route_transcription",
+        lambda _text, _templates: _route_to(template.id),
+    )
+    monkeypatch.setattr(note_pipeline, "generate_note", _template_result)
 
     first = await worker.process_audio_job({}, str(note.id), str(tmp_path / "audio.wav"), str(user.id))
     second = await worker.process_audio_job({}, str(note.id), str(tmp_path / "audio.wav"), str(user.id))
 
-    assert first["status"] == second["status"] == "general"
+    assert first["status"] == second["status"] == "processed"
     events = list((await worker_db.exec(select(NormalizedEvent))).all())
     documents = list((await worker_db.exec(select(GeneratedDocument))).all())
     executions = list((await worker_db.exec(select(WorkflowExecution))).all())
     actions = list((await worker_db.exec(select(ActionExecution))).all())
-    assert len(events) == len(documents) == len(executions) == len(actions) == 1
-    assert events[0].metadata_json["capture_mode"] == "intentional"
-    assert documents[0].template_version == "general-v1"
-    assert executions[0].source_id == str(documents[0].id)
-    assert executions[0].workflow_id == workflow.id
+    # One event, one document, exactly one prepared action — and no workflow
+    # execution, because nothing emits DOCUMENT_GENERATED triggers.
+    assert len(events) == 1
+    assert len(documents) == 1
+    assert len(executions) == 0
+    assert len(actions) == 1
+    assert "capture_mode" not in events[0].metadata_json
+    assert documents[0].template_version == str(template.version)
+    assert actions[0].action_type == "CREATE_TASK"
     assert actions[0].status == expected_status
-    assert classify.await_count == 1
+    assert actions[0].action_input["title"] == "Review generated note"
     assert workspace.id == documents[0].workspace_id
+    # The retry reuses the same durable row rather than preparing a second one.
+    assert actions[0].idempotency_key.startswith("template-action-v1:")
 
 
 async def test_pending_actions_worker_job_calls_executor_without_exposing_payload(monkeypatch):
@@ -139,13 +181,13 @@ async def test_recovery_retries_missing_document_after_first_failure(worker_db, 
         external_id=str(note.id),
         content="private transcript must not appear in logs",
         occurred_at=note.created_at,
-        metadata_json={"capture_mode": "intentional"},
+        metadata_json={},
     )
     note.status = NoteStatus.PROCESSED
+    note.body = "Recovered summary"
     note.structured_data = {"tipo": "nota_geral", "nota": "Recovered summary"}
     worker_db.add_all([note, event])
     await worker_db.commit()
-    monkeypatch.setattr(document_pipeline, "classify_event", AsyncMock(return_value=[]))
     real_process = document_recovery.process_generated_note
     attempts = 0
 
@@ -165,14 +207,18 @@ async def test_recovery_retries_missing_document_after_first_failure(worker_db, 
     second = await document_recovery.reconcile_missing_documents(worker_db, limit=10)
     assert second["recovered"] == 1
     document = (await worker_db.exec(select(GeneratedDocument))).one()
-    execution = (await worker_db.exec(select(WorkflowExecution))).one()
     assert document.note_id == note.id
-    assert execution.source_id == str(document.id)
+    # The note was general (no template), so recovery prepares no actions, and no
+    # workflow execution exists because nothing emits DOCUMENT_GENERATED triggers.
+    executions = list((await worker_db.exec(select(WorkflowExecution))).all())
+    actions = list((await worker_db.exec(select(ActionExecution))).all())
+    assert executions == [] and actions == []
+    # Recovery never regenerates content: the note's own body is what is stored.
+    assert document.rendered_content == note.body
 
 
-async def test_recovery_ignores_continuous_legacy_and_missing_or_unprocessed_notes(worker_db):
-    workspace, user, _, note = await _runtime_identity(worker_db)
-    note.status = NoteStatus.PROCESSED
+async def test_recovery_ignores_legacy_and_missing_or_unprocessed_notes(worker_db):
+    workspace, user, _, note = await _runtime_identity(worker_db)  # ainda não processada
     await worker_db.flush()
     events = [
         NormalizedEvent(
@@ -183,7 +229,7 @@ async def test_recovery_ignores_continuous_legacy_and_missing_or_unprocessed_not
             external_id=str(note.id),
             content="not logged",
             occurred_at=note.created_at,
-            metadata_json={"capture_mode": "continuous"},
+            metadata_json={},
         ),
         NormalizedEvent(
             workspace_id=workspace.id,
@@ -203,7 +249,7 @@ async def test_recovery_ignores_continuous_legacy_and_missing_or_unprocessed_not
             external_id=str(uuid.uuid4()),
             content="not logged",
             occurred_at=note.created_at,
-            metadata_json={"capture_mode": "intentional"},
+            metadata_json={},
         ),
     ]
     worker_db.add_all(events)
@@ -211,8 +257,9 @@ async def test_recovery_ignores_continuous_legacy_and_missing_or_unprocessed_not
 
     result = await document_recovery.reconcile_missing_documents(worker_db, limit=10)
 
+    # nota não processada, external_id inválido e nota inexistente: nada a recuperar
     assert result["recovered"] == 0
-    assert result["skipped"] == 1
+    assert result["skipped"] == 3
     assert list((await worker_db.exec(select(GeneratedDocument))).all()) == []
 
 

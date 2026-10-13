@@ -14,7 +14,6 @@ from app.models.note import Note, NoteStatus
 from app.models.normalized_event import NormalizedEvent
 from app.models.source_policy import SourceMonitoringPolicy
 from app.models.template import Template
-from app.models.template_routing_rule import TemplateRoutingRule
 from app.models.user import User
 from app.models.user_secret import UserSecret
 from app.models.workspace import Workspace, WorkspaceMembership
@@ -43,7 +42,6 @@ __all__ = [
     "NoteStatus",
     "NormalizedEvent",
     "Template",
-    "TemplateRoutingRule",
     "User",
     "UserMCPServer",
     "UserMCPOAuthCredential",

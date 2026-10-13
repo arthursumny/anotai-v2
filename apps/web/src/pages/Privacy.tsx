@@ -310,7 +310,7 @@ export default function Privacy() {
                 {count !== null && <span className="muted"> · {count} {count === 1 ? "item" : "itens"}</span>}
                 <span className="muted"> · {fmtTime(item.created_at)}</span>
               </span>
-              <span className={`badge ${item.status === "success" ? "processed" : item.status === "partial" ? "no_match" : "pending_review"}`}>
+              <span className={`badge ${item.status === "success" ? "processed" : item.status === "partial" ? "warning" : "pending_review"}`}>
                 {AUDIT_STATUS[item.status] ?? item.status}
               </span>
             </div>

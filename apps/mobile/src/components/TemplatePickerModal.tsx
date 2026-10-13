@@ -21,7 +21,7 @@ interface Props {
   onClose: () => void;
 }
 
-/** Seletor de template para classificação manual da nota (fallback no_match). */
+/** Seletor de template para corrigir manualmente a classificação da nota. */
 export default function TemplatePickerModal({
   visible,
   templates,

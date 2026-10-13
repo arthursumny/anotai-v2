@@ -11,7 +11,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models.action_item import ActionSuggestion, FollowUp, Reminder, Task
 from app.models.normalized_event import NormalizedEvent
-from app.models.note import KanbanColumn, Note, NoteStatus
+from app.models.note import Note
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMembership
 
@@ -75,8 +75,6 @@ async def accept_pendency(
     due_at: datetime | None = None,
     remind_at: datetime | None = None,
 ) -> dict[str, Any]:
-    if kind == "note_suggestion":
-        return await _accept_note_suggestion(session, user, item_id, due_at=due_at, remind_at=remind_at)
     if kind == "follow_up":
         return await _accept_followup_suggestion(
             session, user, item_id, title=title, remind_at=remind_at,
@@ -94,21 +92,12 @@ async def accept_pendency(
         raise PendencyActionError(404, "Pendency not found")
 
     # Acceptance already committed: retries only return the durable result.
-    if item.status in ({"consumed"} if kind == "task" else {"scheduled"}):
+    if item.status in ({"open", "in_progress", "done"} if kind == "task" else {"scheduled"}):
         return {"kind": kind, "id": item.id, "status": item.status}
     if item.status != "suggested":
         raise PendencyActionError(409, "Pendency is no longer suggested")
 
-    source_note = await _source_note(session, item, workspace_id, user.id)
-    if kind == "task" and source_note is not None:
-        data = source_note.structured_data if isinstance(source_note.structured_data, dict) else {}
-        cards = data.get("kanban_task_ids")
-        if isinstance(cards, list) and cards:
-            item.status = "superseded"
-            item.updated_at = datetime.now(timezone.utc)
-            session.add(item)
-            await session.commit()
-            raise PendencyActionError(409, "Audio note already has Kanban cards")
+    source_note = await _source_note(session, item, workspace_id, user.id) if kind == "reminder" else None
     if kind == "reminder" and source_note is not None and source_note.reminder_at is not None:
         item.status = "superseded"
         item.updated_at = datetime.now(timezone.utc)
@@ -119,8 +108,10 @@ async def accept_pendency(
     if kind == "reminder" and remind_at is None:
         raise PendencyActionError(422, "remind_at is required")
 
-    values: dict[str, Any] = {"status": "consumed" if kind == "task" else "scheduled",
+    values: dict[str, Any] = {"status": "open" if kind == "task" else "scheduled",
                               "updated_at": datetime.now(timezone.utc)}
+    if kind == "task":
+        values["kanban_status"] = "todo"
     if title is not None:
         values["title"] = title
     if kind == "reminder":
@@ -139,50 +130,14 @@ async def accept_pendency(
         latest = (await session.exec(select(model).where(
             model.id == item_id, model.workspace_id == workspace_id, model.user_id == user.id,
         ))).first()
-        if latest is not None and latest.status in ({"consumed"} if kind == "task" else {"scheduled"}):
+        if latest is not None and latest.status in ({"open", "in_progress", "done"} if kind == "task" else {"scheduled"}):
             return {"kind": kind, "id": latest.id, "status": latest.status}
         raise PendencyActionError(409, "Pendency is no longer suggested")
 
-    if kind == "task":
-        task_title = title if title is not None else item.title
-        note = Note(
-            user_id=user.id,
-            title=task_title,
-            raw_transcription="",
-            structured_data={"origin_task_id": str(item_id)},
-            status=NoteStatus.PROCESSED,
-            kanban_status=KanbanColumn.TODO.value,
-            due_date=_utc(due_at if due_at is not None else item.due_at),
-        )
-        session.add(note)
     await session.commit()
     if kind == "reminder":
         return {"kind": kind, "id": item_id, "status": "scheduled", "remind_at": _utc(remind_at)}
-    return {"kind": kind, "id": item_id, "status": "consumed"}
-
-
-async def _accept_note_suggestion(
-    session: AsyncSession, user: User, item_id: uuid.UUID, *,
-    due_at: datetime | None, remind_at: datetime | None,
-) -> dict[str, Any]:
-    await _membership_and_timezone(session, user)
-    values: dict[str, Any] = {"status": NoteStatus.PROCESSED, "kanban_status": KanbanColumn.TODO.value}
-    if due_at is not None:
-        values["due_date"] = _utc(due_at)
-    if remind_at is not None:
-        values["reminder_at"] = _utc(remind_at)
-    updated = (await session.exec(update(Note).where(
-        Note.id == item_id, Note.user_id == user.id, Note.status == NoteStatus.SUGGESTED,
-    ).values(**values).returning(Note.id))).first()
-    if updated is None:
-        note = (await session.exec(select(Note).where(Note.id == item_id, Note.user_id == user.id))).first()
-        if note is None:
-            raise PendencyActionError(404, "Pendency not found")
-        if note.status == NoteStatus.PROCESSED and note.kanban_status == KanbanColumn.TODO.value:
-            return {"kind": "note_suggestion", "id": item_id, "status": "processed"}
-        raise PendencyActionError(409, "Note suggestion is no longer available")
-    await session.commit()
-    return {"kind": "note_suggestion", "id": item_id, "status": "processed"}
+    return {"kind": kind, "id": item_id, "status": "open"}
 
 
 async def _accept_followup_suggestion(
@@ -302,14 +257,7 @@ async def ignore_pendency(
         raise PendencyActionError(409, "Dismiss approvals via /workflows/executions/{id}/dismiss")
     workspace_id, _ = await _membership_and_timezone(session, user)
     now = datetime.now(timezone.utc)
-    if kind == "note_suggestion":
-        model = Note
-        scope = (Note.id == item_id, Note.user_id == user.id)
-        active = Note.status == NoteStatus.SUGGESTED
-        dismissed = NoteStatus.DISCARDED.value
-        status_column = Note.status
-        already_dismissed = Note.status == NoteStatus.DISCARDED
-    elif kind in {"task", "reminder", "action"}:
+    if kind in {"task", "reminder", "action"}:
         model = {"task": Task, "reminder": Reminder, "action": ActionSuggestion}[kind]
         scope = (model.id == item_id, model.workspace_id == workspace_id, model.user_id == user.id)
         active = model.status == "suggested"
@@ -339,8 +287,8 @@ async def ignore_pendency(
 
     updated = (await session.exec(update(model).where(*scope, active).values(
         status=dismissed,
+        updated_at=now,
         **({"response_status": "dismissed"} if kind == "follow_up" and model is FollowUp else {}),
-        **({"updated_at": now} if kind != "note_suggestion" else {}),
     ).returning(model.id))).first()
     if updated is None:
         row = (await session.exec(select(model).where(*scope))).first()
@@ -361,11 +309,7 @@ async def snooze_pendency(
     now = datetime.now(timezone.utc)
     if target is None or target <= now:
         raise PendencyActionError(422, "until must be in the future")
-    if kind == "note_suggestion":
-        model = Note
-        scope = (Note.id == item_id, Note.user_id == user.id)
-        active = Note.status == NoteStatus.SUGGESTED
-    elif kind == "follow_up":
+    if kind == "follow_up":
         suggestion = (await session.exec(select(ActionSuggestion).where(
             ActionSuggestion.id == item_id,
             ActionSuggestion.workspace_id == workspace_id,
@@ -391,7 +335,7 @@ async def snooze_pendency(
         raise PendencyActionError(422, "Unsupported pendency kind")
     updated = (await session.exec(update(model).where(*scope, active).values(
         snoozed_until=target,
-        **({"updated_at": now} if kind != "note_suggestion" else {}),
+        updated_at=now,
     ).returning(model.id))).first()
     if updated is None:
         row = (await session.exec(select(model).where(*scope))).first()
@@ -414,13 +358,7 @@ async def edit_pendency(
 ) -> dict[str, Any]:
     if kind == "approval":
         raise PendencyActionError(409, "Approval payloads cannot be edited here")
-    if kind == "note_suggestion":
-        model = Note
-        workspace_id, _ = await _membership_and_timezone(session, user)
-        scope = (Note.id == item_id, Note.user_id == user.id)
-        active = Note.status == NoteStatus.SUGGESTED
-        time_columns = {"due_at": "due_date", "remind_at": "reminder_at"}
-    elif kind == "follow_up":
+    if kind == "follow_up":
         workspace_id, _ = await _membership_and_timezone(session, user)
         model = ActionSuggestion
         scope = (ActionSuggestion.id == item_id, ActionSuggestion.workspace_id == workspace_id,
@@ -444,8 +382,7 @@ async def edit_pendency(
         values[time_columns["remind_at"]] = _utc(remind_at)
     if not values:
         raise PendencyActionError(422, "At least one edit field is required")
-    if kind != "note_suggestion":
-        values["updated_at"] = datetime.now(timezone.utc)
+    values["updated_at"] = datetime.now(timezone.utc)
     updated = (await session.exec(update(model).where(*scope, active).values(**values).returning(model.id))).first()
     if updated is None:
         row = (await session.exec(select(model).where(*scope))).first()
