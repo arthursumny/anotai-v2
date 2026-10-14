@@ -237,8 +237,15 @@ async def test_calendar_proxy_uses_owned_connection_and_safe_event_payload(db_se
             seen["api_key"] = api_key
             seen["base_url"] = base_url
 
-        async def proxy_request(self, method, path, **kwargs):
-            seen.update({"method": method, "path": path, **kwargs})
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+            seen.update({
+                "method": method,
+                "endpoint": endpoint,
+                "connection_id": connection_id,
+                "provider_config_key": provider_config_key,
+                "params": params,
+                "json": json,
+            })
             return SimpleNamespace(status_code=200, body={"id": "google_event_123", "htmlLink": "do-not-return"})
 
     monkeypatch.setattr(integration_service, "NangoClient", FakeNangoClient)
@@ -249,10 +256,10 @@ async def test_calendar_proxy_uses_owned_connection_and_safe_event_payload(db_se
     assert seen["api_key"] == "nango-env-secret"
     assert seen["base_url"] == "https://nango.example.test"
     assert seen["method"] == "POST"
-    assert seen["path"] == "calendar/v3/calendars/primary/events"
+    assert seen["endpoint"] == "calendar/v3/calendars/primary/events"
     assert seen["connection_id"] == "nango_conn_123"
     assert seen["provider_config_key"] == "google-calendar-key"
-    assert seen["json_body"] == {
+    assert seen["json"] == {
         "summary": "Quarterly review",
         "start": {"dateTime": "2030-01-15T10:00:00-05:00", "timeZone": "America/New_York"},
         "end": {"dateTime": "2030-01-15T11:00:00-05:00", "timeZone": "America/New_York"},

@@ -43,8 +43,15 @@ def nango(monkeypatch):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
 
-        async def proxy_request(self, method, path, **kwargs):
-            captured["calls"].append({"method": method, "path": path, **kwargs})
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+            captured["calls"].append({
+                "method": method,
+                "endpoint": endpoint,
+                "connection_id": connection_id,
+                "provider_config_key": provider_config_key,
+                "params": params,
+                "json": json,
+            })
             if captured["error"] is not None:
                 raise captured["error"]
             return SimpleNamespace(status_code=200, body=dict(captured["response"]))
@@ -122,10 +129,10 @@ async def test_create_notion_page_posts_to_the_template_database(db_session, nan
     assert nango["api_key"] == "nango-env-secret"
     assert nango["base_url"] == "https://nango.example.test"
     assert call["method"] == "POST"
-    assert call["path"] == "v1/pages"
+    assert call["endpoint"] == "v1/pages"
     assert call["connection_id"] == "nango_notion_1"
     assert call["provider_config_key"] == "notion-test-key"
-    assert call["json_body"] == {
+    assert call["json"] == {
         "parent": {"database_id": "d1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"},
         "properties": {
             "Name": {"title": [{"text": {"content": "Resumo da reunião"}}]},
@@ -148,9 +155,9 @@ async def test_note_content_cannot_redirect_the_database(db_session, nango):
     # title only ever lands inside the title PROPERTY VALUE.
     assert result["entity"] == "notion_page"
     call = nango["calls"][0]
-    assert call["json_body"]["parent"]["database_id"] == "d0SAFE0001"
-    assert call["json_body"]["properties"]["Name"]["title"][0]["text"]["content"] == "d0EVIL0099"
-    assert "d0EVIL0099" not in str(call["json_body"]["parent"])
+    assert call["json"]["parent"]["database_id"] == "d0SAFE0001"
+    assert call["json"]["properties"]["Name"]["title"][0]["text"]["content"] == "d0EVIL0099"
+    assert "d0EVIL0099" not in str(call["json"]["parent"])
 
 
 async def test_missing_provider_config_key_fails_without_sending(db_session, nango, monkeypatch):
@@ -230,7 +237,7 @@ async def test_proxy_failure_is_sanitized_and_retryable(db_session, nango):
     assert result == "retry_scheduled"
     # The proxy WAS attempted (once) and refused; nothing was silently dropped.
     assert len(nango["calls"]) == 1
-    assert nango["calls"][0]["path"] == "v1/pages"
+    assert nango["calls"][0]["endpoint"] == "v1/pages"
     await db_session.refresh(rows[0])
     assert rows[0].last_error == "integrationexecutionerror"
     assert "http_error" not in (rows[0].last_error or "")

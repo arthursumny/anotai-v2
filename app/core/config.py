@@ -68,8 +68,14 @@ class Settings(BaseSettings):
     NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY: str = ""
     # Identifica a config de integração do Nango para o Google Sheets.
     NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY: str = ""
+    # Identifica a config de integração do Nango para o Google Tasks.
+    NANGO_GOOGLE_TASKS_PROVIDER_CONFIG_KEY: str = ""
+    # Identifica a config de integração do Nango para o Google Drive.
+    NANGO_GOOGLE_DRIVE_PROVIDER_CONFIG_KEY: str = ""
     # Identifica a config de integração do Nango para o Notion.
     NANGO_NOTION_PROVIDER_CONFIG_KEY: str = ""
+    # Database padrão do Notion usado quando a ferramenta não tem binding por template.
+    NANGO_NOTION_DEFAULT_DATABASE_ID: str = ""
     # Identifica a config de integração do Nango para o Slack.
     NANGO_SLACK_PROVIDER_CONFIG_KEY: str = ""
     GMAIL_PUBSUB_TOPIC: str = ""

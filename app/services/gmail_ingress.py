@@ -133,8 +133,8 @@ class GmailSourceProvider:
             if label not in {"SPAM", "TRASH"}
         ] or ["INBOX"]
         response = await self.nango.proxy_request(
-            "POST", _WATCH_PATH, connection_id=connection_id, provider_config_key=provider_config_key,
-            json_body={"topicName": topic, "labelIds": label_ids, "labelFilterBehavior": "include"},
+            "POST", provider_config_key, connection_id, _WATCH_PATH,
+            json={"topicName": topic, "labelIds": label_ids, "labelFilterBehavior": "include"},
         )
         body = response.body if isinstance(response.body, dict) else {}
         expiration_at = _expiration(body.get("expiration"))
@@ -174,8 +174,8 @@ class GmailSourceProvider:
                 params["pageToken"] = page_token
             try:
                 response = await self.nango.proxy_request(
-                    "GET", _HISTORY_PATH, connection_id=connection_id,
-                    provider_config_key=provider_config_key, params=params,
+                    "GET", provider_config_key, connection_id, _HISTORY_PATH,
+                    params=params,
                 )
             except NangoClientError as exc:
                 if exc.status_code == 404:
@@ -254,8 +254,8 @@ class GmailSourceProvider:
         if existing is not None:
             return
         meta_response = await self.nango.proxy_request(
-            "GET", f"gmail/v1/users/me/messages/{message_id}", connection_id=connection_id,
-            provider_config_key=provider_config_key, params={"format": "metadata"},
+            "GET", provider_config_key, connection_id, f"gmail/v1/users/me/messages/{message_id}",
+            params={"format": "metadata"},
         )
         metadata = meta_response.body if isinstance(meta_response.body, dict) else {}
         metadata_payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
@@ -279,8 +279,8 @@ class GmailSourceProvider:
         if not await gmail_policy_allows(candidate, session):
             return
         full_response = await self.nango.proxy_request(
-            "GET", f"gmail/v1/users/me/messages/{message_id}", connection_id=connection_id,
-            provider_config_key=provider_config_key, params={"format": "full"},
+            "GET", provider_config_key, connection_id, f"gmail/v1/users/me/messages/{message_id}",
+            params={"format": "full"},
         )
         full = full_response.body if isinstance(full_response.body, dict) else {}
         payload = full.get("payload") if isinstance(full.get("payload"), dict) else {}

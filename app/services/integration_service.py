@@ -374,10 +374,10 @@ class IntegrationService:
             )
             response = await nango.proxy_request(
                 "POST",
+                connection.provider_config_key,
+                connection.nango_connection_id,
                 "gmail/v1/users/me/messages/send",
-                connection_id=connection.nango_connection_id,
-                provider_config_key=connection.provider_config_key,
-                json_body={"raw": raw},
+                json={"raw": raw},
             )
         except (NangoClientError, ValueError):
             raise IntegrationExecutionError("Gmail request falhou") from None
@@ -428,10 +428,10 @@ class IntegrationService:
             )
             response = await nango.proxy_request(
                 "POST",
+                connection.provider_config_key,
+                connection.nango_connection_id,
                 "calendar/v3/calendars/primary/events",
-                connection_id=connection.nango_connection_id,
-                provider_config_key=connection.provider_config_key,
-                json_body=payload,
+                json=payload,
             )
         except (NangoClientError, ValueError):
             raise IntegrationExecutionError("Google Calendar request falhou") from None
@@ -470,10 +470,10 @@ class IntegrationService:
             )
             response = await nango.proxy_request(
                 "POST",
+                connection.provider_config_key,
+                connection.nango_connection_id,
                 "chat.postMessage",
-                connection_id=connection.nango_connection_id,
-                provider_config_key=connection.provider_config_key,
-                json_body={"channel": channel, "text": action.text},
+                json={"channel": channel, "text": action.text},
             )
         except (NangoClientError, ValueError):
             raise IntegrationExecutionError("Slack request falhou") from None
@@ -529,10 +529,10 @@ class IntegrationService:
             )
             response = await nango.proxy_request(
                 "POST",
+                connection.provider_config_key,
+                connection.nango_connection_id,
                 "v1/pages",
-                connection_id=connection.nango_connection_id,
-                provider_config_key=connection.provider_config_key,
-                json_body=payload,
+                json=payload,
             )
         except (NangoClientError, ValueError):
             raise IntegrationExecutionError("Notion request falhou") from None

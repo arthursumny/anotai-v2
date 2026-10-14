@@ -54,8 +54,13 @@ class _Nango:
         self.responses = list(responses)
         self.calls = []
 
-    async def proxy_request(self, method, path, **kwargs):
-        self.calls.append((method, path, kwargs))
+    async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+        self.calls.append((method, endpoint, {
+            "connection_id": connection_id,
+            "provider_config_key": provider_config_key,
+            "params": params,
+            "json": json,
+        }))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -81,9 +86,9 @@ async def test_renew_watch_parses_milliseconds_without_replacing_cursor(db_sessi
     assert renewed.history_id == "10"
     assert renewed.status == "active"
     assert renewed.expiration_at == datetime.fromtimestamp(1760000000, timezone.utc)
-    assert nango.calls[0][2]["json_body"]["topicName"] == "projects/real/topics/ingress"
-    assert nango.calls[0][2]["json_body"]["labelIds"] == ["INBOX"]
-    assert nango.calls[0][2]["json_body"]["labelFilterBehavior"] == "include"
+    assert nango.calls[0][2]["json"]["topicName"] == "projects/real/topics/ingress"
+    assert nango.calls[0][2]["json"]["labelIds"] == ["INBOX"]
+    assert nango.calls[0][2]["json"]["labelFilterBehavior"] == "include"
 
 
 @pytest.mark.asyncio
@@ -97,7 +102,7 @@ async def test_renew_watch_uses_policy_labels_without_spam_or_trash(db_session, 
     monkeypatch.setattr(settings, "GMAIL_PUBSUB_TOPIC", "projects/p/topics/t")
     nango = _Nango([{"historyId": "99", "expiration": "1760000000000"}])
     await GmailSourceProvider(nango).renew_watch(db_session, connection)
-    assert nango.calls[0][2]["json_body"]["labelIds"] == ["Label_custom"]
+    assert nango.calls[0][2]["json"]["labelIds"] == ["Label_custom"]
 
 
 @pytest.mark.asyncio
@@ -179,8 +184,7 @@ async def test_history_types_string_is_accepted_by_real_nango_adapter():
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
         client = NangoClient("test-key", client=http)
         await client.proxy_request(
-            "GET", "gmail/v1/users/me/history", connection_id="nango-1",
-            provider_config_key="gmail-test",
+            "GET", "gmail-test", "nango-1", "gmail/v1/users/me/history",
             params={"startHistoryId": "10", "historyTypes": "messageAdded"},
         )
     assert requests[0].url.params["historyTypes"] == "messageAdded"

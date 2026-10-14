@@ -57,8 +57,13 @@ class _FakeNango:
     def __init__(self, *_args, **_kwargs):
         pass
 
-    async def proxy_request(self, method, path, **kwargs):
-        type(self).calls.append((method, path, kwargs))
+    async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+        type(self).calls.append((method, endpoint, {
+            "connection_id": connection_id,
+            "provider_config_key": provider_config_key,
+            "params": params,
+            "json": json,
+        }))
         error = type(self).error
         if error is not None:
             raise error
@@ -169,9 +174,9 @@ async def test_rebaseline_calls_only_watch_and_commits_new_baseline_after_consen
     assert response.status_code == 200, response.text
     assert response.json()["gmail_watch_status"] == "active"
     assert len(_FakeNango.calls) == 1
-    method, path, kwargs = _FakeNango.calls[0]
-    assert method == "POST" and path == "gmail/v1/users/me/watch"
-    assert kwargs["json_body"] == {
+    method, endpoint, kwargs = _FakeNango.calls[0]
+    assert method == "POST" and endpoint == "gmail/v1/users/me/watch"
+    assert kwargs["json"] == {
         "topicName": "projects/test/topics/gmail", "labelIds": ["INBOX"],
         "labelFilterBehavior": "include",
     }
@@ -236,8 +241,8 @@ async def test_history_404_marks_gap_visible_and_no_content_fetch_runs(
     class History404:
         calls = []
 
-        async def proxy_request(self, method, path, **kwargs):
-            self.calls.append((method, path))
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+            self.calls.append((method, endpoint))
             raise NangoClientError(404, "http_error")
 
     nango = History404()

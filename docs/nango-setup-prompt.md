@@ -5,8 +5,8 @@
 > A seção **REFERÊNCIA** depois dele é para você consultar enquanto configura o
 > painel — não precisa colar.
 >
-> Estado do código quando escrevi: 629 testes passando, head Alembic
-> `b1c2d3e4f5a6`. Confirme o estado atual antes de começar.
+> Estado do código quando escrevi: 692 testes passando, head Alembic
+> `e5f607182b93`. Confirme o estado atual antes de começar.
 
 ---
 
@@ -24,8 +24,13 @@ consiga ligar a nota em qualquer ferramenta dele.
   mora no banco: só `IntegrationConnection` (provider, provider_config_key,
   nango_connection_id, status).
 - Toda ação externa passa por `NangoClient.proxy_request` em
-  `app/services/nango_client.py`, que tem uma ALLOWLIST de paths por provedor.
-  Ampliar a allowlist exige uma regex justa do endpoint usado — nunca um curinga.
+  `app/services/nango_client.py`, que é um proxy GENÉRICO: sem allowlist de paths
+  por provedor. O proxy roteia qualquer endpoint da API do app com a credencial
+  do usuário. A barreira de segurança subiu para o catálogo declarativo
+  `app/services/tool_registry.py`: cada tool tem nome, provider, JSON Schema de
+  argumentos e endpoint FIXO em código. A LLM só escolhe o NOME da tool e
+  preenche argumentos — nunca URL, host ou escopo. Adicionar integração = uma
+  entrada nova no catálogo (+ conexão ativa do usuário), sem regex no transporte.
 - A regra de identidade é rígida: exige EXATAMENTE UMA conexão ativa por
   (workspace, usuário, provider). Zero ou várias → erro explícito. Não relaxe.
 - O destino (database_id do Notion, canal do Slack, planilha, etc.) vem da
@@ -35,6 +40,8 @@ consiga ligar a nota em qualquer ferramenta dele.
 - Registro único de provedores: `app/services/provider_registry.py`. Status
   `active` = tem execução real; `config_required` = caminho existe, falta a chave;
   `mapping_only` = só declarado. NUNCA marque `active` sem código de execução.
+  Execução "real" hoje inclui o tool calling dinâmico: uma tool em
+  `tool_registry.py` habilitada para um template com conexão ativa do usuário.
 - A UI de integrações lê um array fixo em `apps/web/src/pages/Integrations.tsx`.
   Provedor sem chave de config aparece como "Em configuração", sem botão de
   conectar.
@@ -45,8 +52,10 @@ Ações implementadas e testadas: SEND_EMAIL (Gmail do usuário), SEND_SLACK_MES
 CREATE_NOTION_PAGE, CREATE_CALENDAR_EVENT, CREATE_TASK/CREATE_REMINDER (quadro
 interno), SEND_TELEGRAM, SEND_WEBHOOK, CALL_MCP_TOOL.
 
-Provedores ativos no registry: google_gmail, google_calendar, slack, notion.
-Provedores só mapeados: google_sheets.
+Provedores ativos no registry: google_gmail, google_calendar, google_sheets,
+google_tasks, google_drive, notion, slack (os quatro últimos executam via tool
+calling dinâmico).
+Provedores só mapeados: nenhum hoje.
 
 ## Tarefa 1 — página de setup no painel do Nango
 
@@ -76,28 +85,56 @@ antes do próximo. Para cada action nova são 17 pontos de toque — cf.
 `app/api/v1/integrations.py` (`_provider_configs`), teste novo em `tests/`, e
 `app/models/integration_connection.py` + migration se o provider for novo no CHECK.
 
+### Como decidir o que dá para implementar
+
+**O proxy do Nango é genérico**: `POST https://api.nango.dev/proxy/<endpoint>`
+repassa para a API do app com a credencial do usuário. A doc de cada provedor
+lista endpoints que o Nango conhecidamente roteia — **qualquer endpoint daquele
+provedor que apareça na doc já prova que o path base roteia**, e ações no mesmo
+path base funcionam.
+
+**"Pre-built actions/syncs" NÃO é bloqueio.** São *Functions* — uma conveniência
+que o Nango oferece, não o mecanismo. A doc de Auth é explícita: "Combine with
+Proxy or Functions" — são alternativas. Um provedor descrito como "no pre-built
+actions yet" é implementável normalmente via proxy.
+
+**O que realmente bloqueia** é só: (a) o slug não existir no catálogo
+(`https://nango.dev/docs/api-catalog.txt`, ~1050 provedores), ou (b) o path conter
+algo que o proxy rejeite. Na dúvida, teste com um GET documentado do provedor.
+
+### Configuração no painel — 1x por app, NÃO por usuário
+
+Criar a integração é passo único por app (painel → *Configure New Integration* →
+pick the API, ou `POST /integrations`). O cliente **não** passa por isso: ele só
+autoriza no Connect UI. Para APIs populares o Nango já traz um OAuth app
+compartilhado ("test connections with zero setup") e sugere os escopos
+automaticamente — registrar app própria é recomendado para produção
+(whitelabel, escopos, callback URL), não é pré-requisito para funcionar.
+
+Nosso único trabalho por app: o `unique_key` no Nango tem de bater com
+`NANGO_<APP>_PROVIDER_CONFIG_KEY` no `.env`.
+
 Ordem sugerida por valor para este produto (nota de áudio → ação):
 
   Lote A (Google, mesmo padrão de proxy do Calendar que já funciona):
     - google_sheets  → APPEND_SHEET_ROW (acrescentar linha numa planilha)
     - google-drive   → SAVE_DRIVE_FILE (salvar o documento gerado)
   Lote B (tarefas — o usuário citou "criar no meu tasks"):
-    - google-tasks   → CREATE_GOOGLE_TASK. ATENÇÃO: o Nango documenta só
-      `GET /tasks/v1/users/@me/lists` e afirma "no pre-built actions yet".
-      ANTES de implementar, verifique no painel se `POST
-      /tasks/v1/users/@me/lists/{id}/tasks` passa pelo proxy. Se não passar,
-      pare e reporte — não implemente no escuro.
+    - google-tasks   → tool `create_google_task` (tool calling dinâmico). A
+      criação usa `POST /tasks/v1/lists/@default/tasks` — a lista @default é a
+      "Minhas tarefas" do usuário e evita a variação `/users/@me`. Verifique com
+      um teste real antes de considerar pronto, como qualquer ação externa nova.
   Lote C (docs/CRM):
     - confluence     → CREATE_CONFLUENCE_PAGE
     - jira / linear  → CREATE_ISSUE (com project/team vindo do template)
-    - asana, todoist, clickup, monday, trello → CREATE_TASK (um de cada vez)
+    - asana, todoist, clickup, monday → CREATE_TASK (um de cada vez)
     - airtable       → CREATE_AIRTABLE_RECORD
     - hubspot        → CREATE_HUBSPOT_CONTACT
+    - trello         → CREATE_TRELLO_CARD — ATENÇÃO: é OAUTH1, não OAUTH2;
+      fluxo de auth diferente, confirme antes de incluir.
 
   Microsoft (se quiser cobrir esse público): microsoft-teams → SEND_TEAMS_MESSAGE,
   outlook → SEND_EMAIL (variante Outlook), one-drive → SAVE_DRIVE_FILE.
-  Nota: Trello é OAUTH1 no Nango, não OAUTH2 — fluxo de auth diferente,
-  confirme antes de incluir.
 
   NÃO faça: Obsidian (não está no catálogo do Nango), e não implemente provider
   sem action real só para inflar a lista.
@@ -119,7 +156,10 @@ do Gmail: nada é lido sem o usuário ativar explicitamente.
 
 ## Regras que não pode quebrar
 
-- Nunca enfraquecer `_validate_body` nem a allowlist de paths do proxy.
+- Nunca enfraquecer o catálogo `app/services/tool_registry.py`: endpoint e
+  provider_config_key de cada tool ficam fixos em código; argumentos entram só
+  via JSON Schema e valores que vão para URL são validados antes (ex.:
+  spreadsheet_id/sheet_name da aba do Sheets).
 - Nunca deixar ação sem conexão ativa "funcionar por fallback" — falha explícito.
 - Nunca mandar email/mensagem real em teste; stub do `NangoClient`.
 - Nunca marcar provider `active` no registry sem execução real.
@@ -153,9 +193,9 @@ do Gmail: nada é lido sem o usuário ativar explicitamente.
 
 | App | Slug | Chave a adicionar | Escopo | Estado |
 |---|---|---|---|---|
-| Google Planilhas | `google-sheets` | `NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY` | `spreadsheets` (+ `drive.file` se criar arquivo) | não verificado |
-| Google Drive | `google-drive` | `NANGO_GOOGLE_DRIVE_PROVIDER_CONFIG_KEY` | `drive.file` | não verificado |
-| Google Tasks | `google-tasks` | `NANGO_GOOGLE_TASKS_PROVIDER_CONFIG_KEY` | escopo `tasks` | **bloqueado** — ver Lote B |
+| Google Planilhas | `google-sheets` | `NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY` | `spreadsheets` (+ `drive.file` se criar arquivo) | implementado (tool `append_google_sheet_row`) — confirmar conta real |
+| Google Drive | `google-drive` | `NANGO_GOOGLE_DRIVE_PROVIDER_CONFIG_KEY` | `drive.file` | implementado (tool `create_google_drive_file`) — confirmar conta real |
+| Google Tasks | `google-tasks` | `NANGO_GOOGLE_TASKS_PROVIDER_CONFIG_KEY` | escopo `tasks` | implementado (tool `create_google_task`) — confirmar conta real |
 
 ### Provedores a criar (Lote C)
 

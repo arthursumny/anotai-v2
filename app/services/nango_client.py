@@ -1,9 +1,18 @@
-"""Small, strict HTTP adapter for Nango Connect and Google proxy calls.
+"""Universal HTTP adapter for Nango Connect and the Nango Proxy.
 
-Connect-session creation reads the documented ``{"data": {...}}`` envelope;
-connection lookup reads the documented top-level connection object. Only
-connection ID, provider config key, and the two ownership tags are returned;
-provider credentials and unrelated tags in the upstream payload are discarded.
+The Nango Proxy behaves identically for every API: the caller supplies a method,
+an endpoint, query params and a JSON body, and Nango injects the OAuth
+credentials for the addressed connection. This transport layer is therefore
+fully generic — it validates generic HTTP hygiene (method, endpoint shape, and
+header-scope params) and keeps NO per-provider endpoint allowlist.
+
+The security boundary lives ABOVE this module: ``app/services/tool_registry.py``
+fixes the provider endpoints in server-owned code, so no LLM-generated value ever
+becomes a URL, host, or OAuth scope. Connect-session creation reads the
+documented ``{"data": {...}}`` envelope; connection lookup reads the documented
+top-level connection object. Only the connection ID, provider config key, and the
+two ownership tags are returned; provider credentials and unrelated tags in the
+upstream payload are discarded.
 """
 
 import json
@@ -18,37 +27,17 @@ import httpx
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CONFIG_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 _USER_TAG_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,200}$")
-_PARAM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,49}$")
-# `send` is its own alternative so a POST never rides on the message-id route;
-# everything else under messages/ stays a read-only id lookup.
-_GMAIL_PATH_RE = re.compile(
-    r"^gmail/v1/users/me/(?:profile|messages(?:/send|/[A-Za-z0-9_-]+)?|labels(?:/[A-Za-z0-9_-]+)?|history|watch)$"
-)
-_CALENDAR_PATH_RE = re.compile(
-    r"^calendar/v3/calendars/(?:primary|[A-Za-z0-9@._-]{1,200})/events(?:/[A-Za-z0-9_-]{1,200})?$"
-)
-# Cada app não-Google entra com uma regex JUSTA do que a ação usa de fato.
-# Nunca um curinga: a allowlist existe para impedir que um caller aponte o proxy
-# para um endpoint arbitrário da conta do usuário. Adicionar app = uma linha aqui
-# e uma política de método explícita em `proxy_request`.
-_NOTION_PATH_RE = re.compile(r"^v1/pages$")
-_SLACK_PATH_RE = re.compile(r"^chat\.postMessage$")
-# Apps não-Google são somente POST: são endpoints de escrita, e uma variante de
-# leitura entra deliberadamente quando (e se) uma ação precisar dela.
-_POST_ONLY_PATH_RES = (_NOTION_PATH_RE, _SLACK_PATH_RE)
-_ALLOWED_PROXY_PATH_RES = (_GMAIL_PATH_RE, _CALENDAR_PATH_RE) + _POST_ONLY_PATH_RES
-_SENSITIVE_KEY_RE = re.compile(
-    r"token|secret|password|credential|authorization|api[_-]?key|workspace.?id|user.?id|nango.?connection.?id",
-    re.I,
-)
-_FORBIDDEN_PROXY_KEY_RE = re.compile(
-    r"base.?url.?override|connection.?id|provider.?config.?key|chat.?id|" + _SENSITIVE_KEY_RE.pattern,
-    re.I,
-)
-_CREDENTIAL_VALUE_RE = re.compile(
-    r"\b(?:Bearer\s+\S+|(?:token|secret|password|api[_-]?key)\s*[:=]\s*\S+)", re.I
-)
-_HISTORY_TYPES = {"messageAdded", "messageDeleted", "labelAdded", "labelRemoved"}
+# Header-scope names a caller must never smuggle through the query string. The
+# proxy headers are server-owned; a param with one of these names is rejected.
+_FORBIDDEN_PROXY_PARAM_NAMES = {
+    "connection-id",
+    "provider-config-key",
+    "base-url-override",
+    "authorization",
+    "content-length",
+}
+# Endpoints must be a single path fragment: no whitespace and no control chars.
+_UNSAFE_ENDPOINT_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 ProxyParam = str | int | bool | Sequence[str]
 
 
@@ -259,93 +248,45 @@ class NangoClient:
     async def proxy_request(
         self,
         method: str,
-        path: str,
-        *,
-        connection_id: str,
         provider_config_key: str,
-        params: Mapping[str, ProxyParam] | None = None,
-        json_body: Mapping[str, Any] | None = None,
+        connection_id: str,
+        endpoint: str,
+        params: Mapping[str, str | int | bool] | None = None,
+        json: Any = None,
     ) -> ProxyResponse:
         safe_method = method.upper() if isinstance(method, str) else ""
-        if safe_method not in {"GET", "POST"}:
-            raise ValueError("Proxy permite somente GET/POST")
+        if safe_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("Proxy method não suportado")
         if (
-            not isinstance(path, str)
-            or path.startswith("/")
-            or ".." in path
-            or "\\" in path
-            or any(char in path for char in (":", "?", "#", "%", "//"))
-            or not any(regex.fullmatch(path) for regex in _ALLOWED_PROXY_PATH_RES)
+            not isinstance(endpoint, str)
+            or not endpoint
+            or endpoint != endpoint.strip()
+            or any(token in endpoint for token in ("://", "..", "\\", "?", "#", "%", "//"))
+            or _UNSAFE_ENDPOINT_RE.search(endpoint) is not None
         ):
-            raise ValueError("Proxy path não permitida")
+            raise ValueError("Proxy endpoint inválido")
         safe_id = self._connection_id(connection_id)
         provider_key = self._provider_config_key(provider_config_key)
-        is_gmail_watch = path == "gmail/v1/users/me/watch"
-        is_gmail_send = path == "gmail/v1/users/me/messages/send"
-        is_gmail_history = path == "gmail/v1/users/me/history"
-        if path.startswith("gmail/"):
-            gmail_post_route = is_gmail_watch or is_gmail_send
-            if (gmail_post_route and safe_method != "POST") or (
-                not gmail_post_route and safe_method != "GET"
-            ):
-                raise ValueError("Método não permitido para este recurso Google")
-        elif safe_method != "POST":
-            # Notion, Slack e qualquer app não-Google: somente escrita via POST.
-            raise ValueError("Método não permitido para este recurso")
-        safe_params: dict[str, str | int | bool | Sequence[str]] = {}
+        safe_params: dict[str, str | int | bool] = {}
         for key, value in (params or {}).items():
-            is_page_token = isinstance(key, str) and key == "pageToken" and is_gmail_history
-            valid_value = isinstance(value, (str, int, bool)) or (
-                is_gmail_history
-                and key == "historyTypes"
-                and isinstance(value, (list, tuple))
-                and 1 <= len(value) <= 4
-                and all(isinstance(item, str) for item in value)
-            )
             if (
                 not isinstance(key, str)
-                or not _PARAM_RE.fullmatch(key)
-                or (_FORBIDDEN_PROXY_KEY_RE.search(key) and not is_page_token)
-                or key.lower() in {"base-url-override", "host", "connection-id", "provider-config-key"}
-                or not valid_value
+                or key.lower() in _FORBIDDEN_PROXY_PARAM_NAMES
+                or not isinstance(value, (str, int, bool))
             ):
                 raise ValueError("Proxy params inválidos")
-            if is_gmail_history and key not in {"startHistoryId", "pageToken", "historyTypes"}:
-                raise ValueError("Gmail history params inválidos")
-            if is_gmail_history and key == "startHistoryId" and not re.fullmatch(r"[0-9]+", str(value)):
-                raise ValueError("startHistoryId inválido")
-            if is_gmail_history and key == "historyTypes":
-                history_types = value if isinstance(value, (list, tuple)) else [value]
-                if any(item not in _HISTORY_TYPES for item in history_types):
-                    raise ValueError("historyTypes inválido")
             safe_params[key] = value
-        if json_body is not None:
-            if not isinstance(json_body, Mapping):
-                raise ValueError("Proxy JSON body inválido")
-            self._validate_body(json_body)
-
+        # `json` is forwarded verbatim: the generic transport must not paraphrase
+        # user content, and credential-shaped note text is a false positive.
         response = await self._request(
             safe_method,
-            f"/proxy/{path}",
+            f"/proxy/{endpoint}",
             headers={"Connection-Id": safe_id, "Provider-Config-Key": provider_key},
             params=safe_params or None,
-            json=dict(json_body) if json_body is not None else None,
+            json=json,
         )
         try:
             body = response.json()
         except ValueError:
             raise NangoClientError(response.status_code, "invalid_proxy_response") from None
         return ProxyResponse(status_code=response.status_code, body=body)
-
-    @classmethod
-    def _validate_body(cls, value: Any) -> None:
-        if isinstance(value, Mapping):
-            if any(not isinstance(key, str) or _FORBIDDEN_PROXY_KEY_RE.search(key) for key in value):
-                raise ValueError("Proxy body contém campo de credencial ou escopo")
-            for nested in value.values():
-                cls._validate_body(nested)
-        elif isinstance(value, list):
-            for nested in value:
-                cls._validate_body(nested)
-        elif isinstance(value, str) and _CREDENTIAL_VALUE_RE.search(value):
-            raise ValueError("Proxy body contém possível credencial")

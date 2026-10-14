@@ -1,5 +1,6 @@
 """The single recording/document flow shared by processing and manual retries."""
 
+import logging
 from datetime import timezone
 
 from sqlmodel import select
@@ -14,7 +15,10 @@ from app.services.event_ingestion import EventCandidate, ingest
 from app.services.extractor import generate_note
 from app.services.general_note import generate_general_note
 from app.services.router import route_transcription
+from app.services.trigger_executor import execute_template_tools
 from app.services.workflow_engine import prepare_template_actions
+
+logger = logging.getLogger(__name__)
 
 
 async def process_transcription(
@@ -71,3 +75,15 @@ async def process_transcription(
     await session.commit()
     await prepare_template_actions(session, note, note.user_id)
     await session.commit()
+    # A execução das ferramentas de integração é best-effort: uma falha de
+    # tool/LLM/credencial NUNCA pode quebrar o fluxo gravação→nota.
+    try:
+        await execute_template_tools(
+            session,
+            user_id=note.user_id,
+            template_id=note.template_id,
+            transcription=note.raw_transcription,
+            note_body=note.body or "",
+        )
+    except Exception:
+        logger.exception("Falha ao executar as ferramentas de integração da nota")

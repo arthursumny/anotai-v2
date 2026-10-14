@@ -46,8 +46,15 @@ def nango(monkeypatch):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
 
-        async def proxy_request(self, method, path, **kwargs):
-            captured["calls"].append({"method": method, "path": path, **kwargs})
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+            captured["calls"].append({
+                "method": method,
+                "endpoint": endpoint,
+                "connection_id": connection_id,
+                "provider_config_key": provider_config_key,
+                "params": params,
+                "json": json,
+            })
             if captured["error"] is not None:
                 raise captured["error"]
             return SimpleNamespace(status_code=200, body=dict(captured["response"]))
@@ -167,10 +174,10 @@ async def test_send_email_proxies_mime_through_owned_gmail_connection(
     assert nango["api_key"] == "nango-env-secret"
     assert nango["base_url"] == "https://nango.example.test"
     assert call["method"] == "POST"
-    assert call["path"] == "gmail/v1/users/me/messages/send"
+    assert call["endpoint"] == "gmail/v1/users/me/messages/send"
     assert call["connection_id"] == "nango_conn_1"
     assert call["provider_config_key"] == "gmail-test-key"
-    message = _decode_mime(call["json_body"]["raw"])
+    message = _decode_mime(call["json"]["raw"])
     assert message["To"] == (explicit_to or user.email)
     assert message["Subject"] == "Reunião confirmada"
     # The sender identity belongs to the connected account: never forged here.
@@ -311,7 +318,7 @@ async def test_message_id_stays_idempotent_across_retries(db_session, nango):
     # Then both deliveries carry the same deterministic Message-ID.
     assert len(nango["calls"]) == 2
     message_ids = [
-        _decode_mime(call["json_body"]["raw"])["Message-ID"]
+        _decode_mime(call["json"]["raw"])["Message-ID"]
         for call in nango["calls"]
     ]
     expected = hashlib.sha256(execution.idempotency_key.encode("utf-8")).hexdigest()

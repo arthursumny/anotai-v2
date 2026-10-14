@@ -26,8 +26,13 @@ class _WatchNango:
         self.calls = []
         self.fail = fail
 
-    async def proxy_request(self, method, path, **kwargs):
-        self.calls.append((method, path, kwargs))
+    async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+        self.calls.append((method, endpoint, {
+            "connection_id": connection_id,
+            "provider_config_key": provider_config_key,
+            "params": params,
+            "json": json,
+        }))
         if self.fail:
             raise RuntimeError("Nango unavailable")
         return ProxyResponse(200, {"historyId": "42", "expiration": "1760000000000"})
@@ -176,7 +181,7 @@ async def test_gmail_opt_in_immediately_starts_watch_with_server_config(client, 
     assert response.status_code == 200
     assert response.json()["monitor_enabled"] is True
     assert len(nango.calls) == 1
-    assert nango.calls[0][2]["json_body"]["labelIds"] == ["INBOX"]
+    assert nango.calls[0][2]["json"]["labelIds"] == ["INBOX"]
     await db_session.refresh(watch)
     assert watch.status == "active"
 

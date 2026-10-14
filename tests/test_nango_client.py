@@ -1,6 +1,5 @@
-"""HTTP-mocked contract tests for the pure Nango adapter."""
+"""HTTP-mocked contract tests for the generic Nango adapter."""
 
-import base64
 import json
 
 import httpx
@@ -97,287 +96,170 @@ async def test_connection_metadata_redacts_credentials_and_fails_closed_on_unkno
     assert "do-not-leak" not in str(error.value)
 
 
-async def test_proxy_google_paths_attach_only_server_owned_headers():
+@pytest.mark.parametrize(
+    "method, endpoint, params, json_body",
+    [
+        ("POST", "tasks/v1/lists/@default/tasks", None, {"title": "Lembrete"}),
+        ("POST", "drive/v3/files", None, {"name": "nota.md", "mimeType": "text/markdown"}),
+        (
+            "POST",
+            "sheets/v4/spreadsheets/s1/values/Sheet1!A1:append",
+            {"valueInputOption": "USER_ENTERED"},
+            {"range": "Sheet1!A1", "values": [["a", "b"]]},
+        ),
+        ("POST", "v1/pages", None, {"parent": {"database_id": "db_1"}}),
+        ("GET", "gmail/v1/users/me/messages", {"maxResults": 10}, None),
+        ("GET", "anything/v1/resource", None, None),
+    ],
+)
+async def test_generic_proxy_endpoints_attach_only_server_owned_headers(
+    method, endpoint, params, json_body
+):
     captured = {}
 
     def handler(request: httpx.Request):
         captured["request"] = request
-        return httpx.Response(200, json={"messages": [{"id": "message-1"}]})
+        return httpx.Response(200, json={"ok": True})
 
     client, http = _client(handler)
     try:
         response = await client.proxy_request(
-            "GET",
-            "gmail/v1/users/me/messages",
-            connection_id="conn_123",
-            provider_config_key="google-mail",
-            params={"maxResults": 10},
+            method, "google-mail", "conn_123", endpoint, params=params, json=json_body,
         )
     finally:
         await http.aclose()
 
     request = captured["request"]
-    assert str(request.url) == "https://api.nango.dev/proxy/gmail/v1/users/me/messages?maxResults=10"
+    assert request.method == method
+    assert request.url.path == f"/proxy/{endpoint}"
     assert request.headers["Authorization"] == "Bearer nango-test-secret"
     assert request.headers["Connection-Id"] == "conn_123"
     assert request.headers["Provider-Config-Key"] == "google-mail"
     assert "Base-Url-Override" not in request.headers
     assert response.status_code == 200
-    assert response.body == {"messages": [{"id": "message-1"}]}
+    assert response.body == {"ok": True}
 
 
-async def test_gmail_profile_proxy_allows_exact_get_route_only():
-    captured = []
+async def test_put_patch_delete_and_lowercase_methods_pass_through():
+    seen = []
 
     def handler(request: httpx.Request):
-        captured.append(request)
-        return httpx.Response(200, json={"emailAddress": "person@example.com", "messagesTotal": 12})
+        seen.append(request.method)
+        return httpx.Response(200, json={})
 
     client, http = _client(handler)
     try:
-        response = await client.proxy_request(
-            "GET",
-            "gmail/v1/users/me/profile",
-            connection_id="conn_123",
-            provider_config_key="google-mail",
-        )
-        assert response.body["emailAddress"] == "person@example.com"
-
-        for method, bad_path in (
-            ("POST", "gmail/v1/users/me/profile"),
-            ("GET", "gmail/v1/users/me/profile?alt=json"),
-            ("GET", "gmail/v1/users/me/../profile"),
-            ("GET", "gmail/v1/users/me/profiles/anything"),
-        ):
-            with pytest.raises(ValueError, match="path|Método"):
-                await client.proxy_request(
-                    method,
-                    bad_path,
-                    connection_id="conn_123",
-                    provider_config_key="google-mail",
-                )
+        for method in ("PUT", "PATCH", "DELETE"):
+            await client.proxy_request(method.lower(), "cfg", "conn_123", "v1/resources/abc")
     finally:
         await http.aclose()
 
-    assert len(captured) == 1
-    assert captured[0].method == "GET"
-    assert captured[0].url.path == "/proxy/gmail/v1/users/me/profile"
-    assert captured[0].headers["Connection-Id"] == "conn_123"
-    assert captured[0].headers["Provider-Config-Key"] == "google-mail"
+    assert seen == ["PUT", "PATCH", "DELETE"]
 
 
-async def test_proxy_calendar_post_and_no_external_or_path_injection():
+@pytest.mark.parametrize("method", ["OPTIONS", "HEAD", "TRACE", "", "GETS"])
+async def test_unknown_methods_are_rejected(method):
+    client, http = _client(lambda _request: pytest.fail("unexpected HTTP"))
+    try:
+        with pytest.raises(ValueError, match="method"):
+            await client.proxy_request(method, "cfg", "conn_123", "v1/resources")
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evil.example/x",
+        "../x",
+        "x/../y",
+        "x?y=1",
+        "x#f",
+        "x\\y",
+        " x",
+        "",
+        "a b",
+        "a%2Fb",
+        "a//b",
+    ],
+)
+async def test_invalid_endpoints_are_rejected(endpoint):
+    client, http = _client(lambda _request: pytest.fail("unexpected HTTP"))
+    try:
+        with pytest.raises(ValueError, match="endpoint"):
+            await client.proxy_request("GET", "cfg", "conn_123", endpoint)
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["Connection-Id", "Base-Url-Override", "Provider-Config-Key", "Authorization", "Content-Length"],
+)
+async def test_header_scope_param_names_are_rejected(key):
+    client, http = _client(lambda _request: pytest.fail("unexpected HTTP"))
+    try:
+        with pytest.raises(ValueError, match="params"):
+            await client.proxy_request("GET", "cfg", "conn_123", "v1/resource", params={key: "x"})
+    finally:
+        await http.aclose()
+
+
+async def test_json_body_forwarded_verbatim_and_params_become_query_string():
     captured = {}
 
     def handler(request: httpx.Request):
         captured["request"] = request
-        return httpx.Response(200, json={"id": "event-1", "summary": "Meeting"})
+        return httpx.Response(200, json={"id": "x"})
 
-    client, http = _client(handler)
-    try:
-        response = await client.proxy_request(
-            "POST",
-            "calendar/v3/calendars/primary/events",
-            connection_id="conn_123",
-            provider_config_key="google-calendar",
-            json_body={"summary": "Review", "start": {"dateTime": "2030-01-01T10:00:00Z"}},
-        )
-        assert response.body["id"] == "event-1"
-        for bad_path in (
-            "https://evil.example/gmail/v1/users/me/messages",
-            "gmail/v1/../../connections/conn_123",
-            "gmail/v1/users/me/messages%2f..",
-            "gmail/v1/users/me/users/other/messages",
-        ):
-            with pytest.raises(ValueError, match="path"):
-                await client.proxy_request(
-                    "GET", bad_path, connection_id="conn_123", provider_config_key="google-mail"
-                )
-        with pytest.raises(ValueError, match="Proxy params"):
-            await client.proxy_request(
-                "GET",
-                "gmail/v1/users/me/messages",
-                connection_id="conn_123",
-                provider_config_key="google-mail",
-                params={"Base-Url-Override": "https://evil.example"},
-            )
-        with pytest.raises(ValueError, match="Proxy body"):
-            await client.proxy_request(
-                "POST",
-                "calendar/v3/calendars/primary/events",
-                connection_id="conn_123",
-                provider_config_key="google-calendar",
-                json_body={"nangoConnectionId": "attacker-id"},
-            )
-    finally:
-        await http.aclose()
-
-    assert captured["request"].method == "POST"
-    assert captured["request"].url.path == "/proxy/calendar/v3/calendars/primary/events"
-    assert json.loads(captured["request"].content) == {
-        "summary": "Review", "start": {"dateTime": "2030-01-01T10:00:00Z"}
+    payload = {
+        # Credential-shaped user content is legitimate note text and must survive.
+        "note": "token=abc123",
+        "nested": {"list": [1, 2, {"deep": True}]},
+        "scalar": 42,
     }
-
-
-async def test_gmail_messages_send_is_post_only_and_accepts_raw_payload():
-    captured = []
-
-    def handler(request: httpx.Request):
-        captured.append(request)
-        return httpx.Response(200, json={"id": "msg-123", "threadId": "thread-1"})
-
     client, http = _client(handler)
     try:
-        raw = base64.urlsafe_b64encode(
-            b"To: dest@example.test\r\nSubject: hi\r\n\r\nHello"
-        ).rstrip(b"=").decode("ascii")
-        response = await client.proxy_request(
+        await client.proxy_request(
             "POST",
-            "gmail/v1/users/me/messages/send",
-            connection_id="conn_123",
-            provider_config_key="google-mail",
-            json_body={"raw": raw},
+            "cfg",
+            "conn_123",
+            "v1/pages",
+            params={"a": "b", "n": 3, "flag": True},
+            json=payload,
         )
-        assert response.body == {"id": "msg-123", "threadId": "thread-1"}
-
-        # POST is allowed on send only: reads stay GET, message ids stay read-only.
-        for method, bad_path in (
-            ("GET", "gmail/v1/users/me/messages/send"),
-            ("POST", "gmail/v1/users/me/messages/msg-123"),
-            ("POST", "gmail/v1/users/me/profile"),
-            ("POST", "gmail/v1/users/me/history"),
-            ("POST", "gmail/v1/users/me/messages/send/../send"),
-        ):
-            with pytest.raises(ValueError, match="path|Método"):
-                await client.proxy_request(
-                    method, bad_path, connection_id="conn_123", provider_config_key="google-mail"
-                )
-        # The credential guard still rejects credential-shaped raw payloads.
-        with pytest.raises(ValueError, match="Proxy body"):
-            await client.proxy_request(
-                "POST",
-                "gmail/v1/users/me/messages/send",
-                connection_id="conn_123",
-                provider_config_key="google-mail",
-                json_body={"raw": "token=abc123"},
-            )
     finally:
         await http.aclose()
 
-    assert len(captured) == 1
-    request = captured[0]
-    assert request.method == "POST"
-    assert request.url.path == "/proxy/gmail/v1/users/me/messages/send"
-    assert json.loads(request.content) == {"raw": raw}
-    assert request.headers["Connection-Id"] == "conn_123"
-    assert request.headers["Provider-Config-Key"] == "google-mail"
+    request = captured["request"]
+    assert json.loads(request.content) == payload
+    assert request.url.params["a"] == "b"
+    assert request.url.params["n"] == "3"
+    assert request.url.params["flag"] == "true"
 
 
-async def test_gmail_history_list_allows_only_get_and_supported_pagination_params():
-    captured = []
+@pytest.mark.parametrize(
+    "body",
+    [
+        [1, "two", {"three": 3}],
+        "plain scalar",
+        7,
+    ],
+)
+async def test_scalar_and_list_json_bodies_pass_through(body):
+    captured = {}
 
     def handler(request: httpx.Request):
-        captured.append(request)
-        return httpx.Response(200, json={"history": [{"id": "100"}]})
+        captured["request"] = request
+        return httpx.Response(200, json={})
 
     client, http = _client(handler)
     try:
-        response = await client.proxy_request(
-            "GET",
-            "gmail/v1/users/me/history",
-            connection_id="conn_123",
-            provider_config_key="google-mail",
-            params={
-                "startHistoryId": "100",
-                "pageToken": "opaque/page+token",
-                "historyTypes": ["messageAdded", "labelRemoved"],
-            },
-        )
-        assert response.body["history"][0]["id"] == "100"
-        with pytest.raises(ValueError, match="Método"):
-            await client.proxy_request(
-                "POST", "gmail/v1/users/me/history", connection_id="conn_123", provider_config_key="google-mail"
-            )
-        with pytest.raises(ValueError, match="historyTypes"):
-            await client.proxy_request(
-                "GET",
-                "gmail/v1/users/me/history",
-                connection_id="conn_123",
-                provider_config_key="google-mail",
-                params={"historyTypes": ["arbitrary"]},
-            )
+        await client.proxy_request("POST", "cfg", "conn_123", "anything/v1/resource", json=body)
     finally:
         await http.aclose()
 
-    assert len(captured) == 1
-    assert captured[0].url.path == "/proxy/gmail/v1/users/me/history"
-    assert captured[0].url.params["startHistoryId"] == "100"
-    assert captured[0].url.params["pageToken"] == "opaque/page+token"
-    assert captured[0].url.params.get_list("historyTypes") == ["messageAdded", "labelRemoved"]
-
-
-async def test_proxy_paths_are_allowlisted_per_provider_and_post_only():
-    """Só endpoints usados de fato passam; o resto é barrado na validação.
-
-    A allowlist é por provedor (regex justa) e não-Google é somente POST. Isso
-    impede que um caller aponte o proxy para um endpoint arbitrário da conta do
-    usuário — inclusive em apps já conectados.
-    """
-    seen = []
-
-    def handler(request: httpx.Request):
-        seen.append(request)
-        return httpx.Response(200, json={"id": "page_1"})
-
-    client, http = _client(handler)
-    try:
-        await client.proxy_request(
-            "POST", "v1/pages", connection_id="conn_123", provider_config_key="notion",
-        )
-        await client.proxy_request(
-            "POST", "chat.postMessage", connection_id="conn_123", provider_config_key="slack",
-        )
-        assert len(seen) == 2
-        assert seen[0].url.path == "/proxy/v1/pages"
-        assert seen[1].url.path == "/proxy/chat.postMessage"
-        assert seen[0].headers["Connection-Id"] == "conn_123"
-        assert seen[1].headers["Provider-Config-Key"] == "slack"
-    finally:
-        await http.aclose()
-
-    # Nao-Google e somente escrita: GET numa rota de criacao nao passa.
-    with pytest.raises(ValueError, match="Método"):
-        await _client(lambda _r: httpx.Response(200, json={}))[0].proxy_request(
-            "GET", "v1/pages", connection_id="conn_123", provider_config_key="notion",
-        )
-
-    # Endpoint do mesmo app que a acao nao usa: barrado.
-    for method, path in (
-        ("POST", "v1/blocks/abc/children"),
-        ("POST", "v1/databases"),
-        ("POST", "chat.postEphemeral"),
-        ("POST", "conversations.list"),
-    ):
-        with pytest.raises(ValueError, match="Proxy path"):
-            await _client(lambda _r: httpx.Response(200, json={}))[0].proxy_request(
-                method, path, connection_id="conn_123", provider_config_key="cfg",
-            )
-
-
-async def test_notion_body_rejects_credential_like_values_without_weakening_guard():
-    """O guard de corpo continua fail-closed: credenciais em valores não passam."""
-    client, http = _client(lambda _r: httpx.Response(200, json={}))
-    try:
-        with pytest.raises(ValueError, match="credencial"):
-            await client.proxy_request(
-                "POST",
-                "v1/pages",
-                connection_id="conn_123",
-                provider_config_key="notion",
-                json_body={"parent": {"database_id": "db_1"}, "properties": {"note": "token=abc123"}},
-            )
-    finally:
-        await http.aclose()
+    assert json.loads(captured["request"].content) == body
 
 
 async def test_http_errors_are_sanitized_and_delete_uses_backend_bearer():
@@ -393,7 +275,7 @@ async def test_http_errors_are_sanitized_and_delete_uses_backend_bearer():
     try:
         with pytest.raises(NangoClientError) as error:
             await client.proxy_request(
-                "GET", "gmail/v1/users/me/messages", connection_id="conn_123", provider_config_key="google-mail"
+                "GET", "google-mail", "conn_123", "gmail/v1/users/me/messages"
             )
         await client.delete_connection("conn_123")
     finally:

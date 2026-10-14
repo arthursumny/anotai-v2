@@ -61,15 +61,15 @@ def gmail_send(monkeypatch):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
 
-        async def proxy_request(self, method, path, **kwargs):
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
             if captured["error"] is not None:
                 raise captured["error"]
             captured["messages"].append({
                 "method": method,
-                "path": path,
-                "connection_id": kwargs["connection_id"],
-                "provider_config_key": kwargs["provider_config_key"],
-                "raw": kwargs["json_body"]["raw"],
+                "endpoint": endpoint,
+                "connection_id": connection_id,
+                "provider_config_key": provider_config_key,
+                "raw": json["raw"],
             })
             return SimpleNamespace(
                 status_code=200, body={"id": "gmail_msg_1", "threadId": "thread_1"},
@@ -123,7 +123,7 @@ async def test_two_selected_templates_execute_only_their_own_actions(db_session,
     assert len(gmail_send["messages"]) == 1
     sent = gmail_send["messages"][0]
     assert sent["method"] == "POST"
-    assert sent["path"] == "gmail/v1/users/me/messages/send"
+    assert sent["endpoint"] == "gmail/v1/users/me/messages/send"
     assert sent["connection_id"] == "nango_conn_1"
     assert sent["provider_config_key"] == "gmail-test-key"
     message = _decode_mime(sent["raw"])

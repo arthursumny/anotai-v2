@@ -45,6 +45,8 @@ def _provider_configs() -> dict[str, tuple[IntegrationProvider, str]]:
     return {
         "google_gmail": ("google_gmail", settings.NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY),
         "google_calendar": ("google_calendar", settings.NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY),
+        "google_tasks": ("google_tasks", settings.NANGO_GOOGLE_TASKS_PROVIDER_CONFIG_KEY),
+        "google_drive": ("google_drive", settings.NANGO_GOOGLE_DRIVE_PROVIDER_CONFIG_KEY),
         "slack": ("slack", settings.NANGO_SLACK_PROVIDER_CONFIG_KEY),
         "notion": ("notion", settings.NANGO_NOTION_PROVIDER_CONFIG_KEY),
     }
@@ -467,9 +469,7 @@ async def nango_webhook(request: Request, session: AsyncSession = Depends(get_se
         if provider == "google_gmail":
             try:
                 profile = await client.proxy_request(
-                    "GET", "gmail/v1/users/me/profile",
-                    connection_id=connection_id,
-                    provider_config_key=provider_key,
+                    "GET", provider_key, connection_id, "gmail/v1/users/me/profile",
                 )
             except (NangoClientError, ValueError):
                 raise HTTPException(status_code=502, detail="Não foi possível validar a conta Gmail") from None

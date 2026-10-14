@@ -96,16 +96,52 @@ PROVIDERS: dict[str, ProviderDefinition] = {definition.provider: definition for 
         config_key_setting="NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY",
         label="Google Planilhas",
         description=(
-            "Mapeamento ainda: nenhuma automação grava em planilhas hoje — a conexão "
-            "está declarada como preparação para essa execução."
+            "Anexa linhas a uma planilha a partir das suas notas, via execução "
+            "dinâmica de ferramentas."
         ),
-        capabilities=(),
+        capabilities=(
+            "Anexar uma linha a uma aba de planilha (append_google_sheet_row)",
+        ),
         oauth_scope_note=(
-            "Quando a execução existir, a config de integração no Nango deverá pedir "
+            "A config de integração no Nango precisa pedir "
             "https://www.googleapis.com/auth/spreadsheets (e "
             "https://www.googleapis.com/auth/drive.file para arquivos criados no Anotaí)."
         ),
-        status=STATUS_MAPPING_ONLY,
+        status=STATUS_ACTIVE,
+    ),
+    ProviderDefinition(
+        provider="google_tasks",
+        config_key_setting="NANGO_GOOGLE_TASKS_PROVIDER_CONFIG_KEY",
+        label="Google Tasks",
+        description=(
+            "Cria tarefas na sua lista padrão a partir das notas, via execução "
+            "dinâmica de ferramentas."
+        ),
+        capabilities=(
+            "Criar uma tarefa na lista padrão da conta conectada (create_google_task)",
+        ),
+        oauth_scope_note=(
+            "A config de integração no Nango precisa pedir "
+            "https://www.googleapis.com/auth/tasks."
+        ),
+        status=STATUS_ACTIVE,
+    ),
+    ProviderDefinition(
+        provider="google_drive",
+        config_key_setting="NANGO_GOOGLE_DRIVE_PROVIDER_CONFIG_KEY",
+        label="Google Drive",
+        description=(
+            "Cria arquivos no seu Drive a partir das notas, via execução dinâmica "
+            "de ferramentas."
+        ),
+        capabilities=(
+            "Criar um arquivo no Drive da conta conectada (create_google_drive_file)",
+        ),
+        oauth_scope_note=(
+            "A config de integração no Nango precisa pedir "
+            "https://www.googleapis.com/auth/drive.file (só arquivos criados no Anotaí)."
+        ),
+        status=STATUS_ACTIVE,
     ),
     ProviderDefinition(
         provider="notion",

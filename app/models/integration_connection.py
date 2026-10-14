@@ -19,7 +19,7 @@ class IntegrationConnection(SQLModel, table=True):
         # Valores permitidos espelham o registro em app/services/provider_registry.py;
         # ampliar exige nova migration (drop + create do check, sem tocar em dados).
         CheckConstraint(
-            "provider IN ('google_gmail', 'google_calendar', 'google_sheets', 'notion', 'slack')",
+            "provider IN ('google_gmail', 'google_calendar', 'google_sheets', 'google_tasks', 'google_drive', 'notion', 'slack')",
             name="ck_integration_connection_provider",
         ),
         CheckConstraint("status IN ('pending', 'active', 'error', 'disconnected')", name="ck_integration_connection_status"),

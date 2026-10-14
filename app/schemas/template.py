@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-ActionType = Literal["telegram", "webhook", "mcp_tool", "email", "create_task", "slack", "notion"]
+ActionType = Literal["telegram", "webhook", "mcp_tool", "email", "create_task", "slack", "notion", "integration"]
 
 
 class _ActionProviderConfig(BaseModel):
@@ -106,6 +106,20 @@ class MCPToolConfig(_ActionProviderConfig):
         return self
 
 
+class IntegrationConfig(_ActionProviderConfig):
+    # A ação de integração é resolvida dinamicamente pelo orquestrador de
+    # tool-calling (trigger_executor), que valida o provider contra o registro
+    # de ferramentas. Aqui só garantimos o formato do nome do provider.
+    provider: StrictStr = Field(min_length=1, max_length=64)
+
+    @field_validator("provider")
+    @classmethod
+    def _provider_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+            raise ValueError("provider de integração inválido")
+        return value
+
+
 ACTION_CONFIG_MODELS = {
     "email": EmailConfig,
     "create_task": TaskConfig,
@@ -114,6 +128,7 @@ ACTION_CONFIG_MODELS = {
     "mcp_tool": MCPToolConfig,
     "slack": SlackConfig,
     "notion": NotionConfig,
+    "integration": IntegrationConfig,
 }
 
 

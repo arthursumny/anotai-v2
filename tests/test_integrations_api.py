@@ -75,8 +75,8 @@ class _FakeNango:
         assert provider_config_key == self.metadata.provider_config_key
         return self.metadata
 
-    async def proxy_request(self, method, path, **kwargs):
-        assert method == "GET" and path == "gmail/v1/users/me/profile"
+    async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+        assert method == "GET" and endpoint == "gmail/v1/users/me/profile"
         if type(self).profile_error:
             raise integrations.NangoClientError(502, "http_error")
         return SimpleNamespace(body=type(self).profile_body)

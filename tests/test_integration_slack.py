@@ -46,8 +46,15 @@ def nango(monkeypatch):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
 
-        async def proxy_request(self, method, path, **kwargs):
-            captured["calls"].append({"method": method, "path": path, **kwargs})
+        async def proxy_request(self, method, provider_config_key, connection_id, endpoint, params=None, json=None):
+            captured["calls"].append({
+                "method": method,
+                "endpoint": endpoint,
+                "connection_id": connection_id,
+                "provider_config_key": provider_config_key,
+                "params": params,
+                "json": json,
+            })
             if captured["error"] is not None:
                 raise captured["error"]
             return SimpleNamespace(status_code=200, body=dict(captured["response"]))
@@ -119,10 +126,10 @@ async def test_send_slack_message_posts_text_to_the_template_channel(db_session,
     assert nango["api_key"] == "nango-env-secret"
     assert nango["base_url"] == "https://nango.example.test"
     assert call["method"] == "POST"
-    assert call["path"] == "chat.postMessage"
+    assert call["endpoint"] == "chat.postMessage"
     assert call["connection_id"] == "nango_slack_1"
     assert call["provider_config_key"] == "slack-test-key"
-    assert call["json_body"] == {
+    assert call["json"] == {
         "channel": "C0EXAMPLE123", "text": "Status do projeto: Tudo certo",
     }
 
@@ -138,7 +145,7 @@ async def test_note_content_cannot_redirect_the_channel(db_session, nango):
     # When it executes, the configured channel is still the only destination.
     result = await IntegrationService().execute_claimed(db_session, execution.id)
     assert result["channel"] == "C0123456789"
-    assert nango["calls"][0]["json_body"] == {"channel": "C0SAFE0001", "text": "C0EVIL0099"}
+    assert nango["calls"][0]["json"] == {"channel": "C0SAFE0001", "text": "C0EVIL0099"}
 
 
 async def test_slack_ok_false_is_never_reported_as_success(db_session, nango):
@@ -269,7 +276,7 @@ async def test_slack_delivery_is_retried_identically(db_session, nango):
     # Then Slack posts are not deduped by us, but the payload stays identical.
     assert first == second
     assert len(nango["calls"]) == 2
-    payloads = [call["json_body"] for call in nango["calls"]]
+    payloads = [call["json"] for call in nango["calls"]]
     assert payloads[0] == payloads[1] == {
         "channel": "C0EXAMPLE123", "text": "Status do projeto: Tudo certo",
     }

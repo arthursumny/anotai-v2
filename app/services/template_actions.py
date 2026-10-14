@@ -190,6 +190,12 @@ async def prepare_template_actions(
     for index, raw in enumerate(template.actions):
         if not isinstance(raw, dict) or raw.get("enabled") is not True:
             continue
+        if raw.get("type") == "integration":
+            # Integrações são executadas pelo orquestrador dinâmico de
+            # tool-calling (trigger_executor), não pelo ledger estático — não
+            # criamos ActionExecution para não gerar linhas permanentemente
+            # falhas.
+            continue
         raw_type = raw.get("type")
         action_type = _ACTION_TYPES.get(raw_type, "INVALID_TEMPLATE_ACTION") if isinstance(raw_type, str) else "INVALID_TEMPLATE_ACTION"
         if await _automation_disabled(session, user, action_type):
