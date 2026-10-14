@@ -38,20 +38,46 @@ const PROVIDERS: {
   tagline: string;
   permission: string;
   footnote: string;
+  /** Rótulo do dono da conta ("Google", "Notion"…) — usado no título do card. */
+  brand: string;
+  /** Só estes podem abrir a janela de conexão hoje (ver provider_registry). */
+  connectable: boolean;
 }[] = [
   {
     id: "google_gmail",
     name: "Gmail",
-    tagline: "O AnotAI pode ficar de olho em e-mails que chegam — só se você pedir.",
-    permission: "Leitura de e-mails recebidos. Conectar não ativa acompanhamento: isso é uma escolha sua, separada, aqui embaixo.",
-    footnote: "Você escolhe de quem o AnotAI pode ver mensagens — e apaga tudo ao parar.",
+    tagline: "Envia e-mails das suas automações a partir da sua conta — e pode ficar de olho no que chega, só se você pedir.",
+    permission: "Acesso à sua conta Google para enviar em seu nome e, se você ativar, ler e-mails recebidos. Sem esta conexão a ação de enviar e-mail falha dizendo que falta conectar.",
+    footnote: "O acompanhamento de e-mails é uma escolha separada, aqui embaixo. Conectar não ativa nada sozinho.",
+    brand: "Google",
+    connectable: true,
   },
   {
     id: "google_calendar",
     name: "Agenda Google",
-    tagline: "Prepara a criação de compromissos a partir das suas notas.",
-    permission: "Acesso à sua agenda. Por enquanto a conexão só deixa tudo pronto: nada é criado na agenda sem você configurar e ver antes.",
-    footnote: "Criação de compromissos a partir de fluxos chega em breve.",
+    tagline: "Cria compromissos na sua agenda a partir das suas notas.",
+    permission: "Acesso à sua agenda para criar eventos. O modo sugestivo pede confirmação; o automático exige preferência e autorização explícitas.",
+    footnote: "Os eventos são criados no calendário principal da conta conectada.",
+    brand: "Google",
+    connectable: true,
+  },
+  {
+    id: "google_sheets",
+    name: "Google Planilhas",
+    tagline: "Mapeamento futuro: nenhuma automação grava em planilhas hoje.",
+    permission: "Ainda não há ação que escreva em planilhas. A conexão está declarada como preparação; ativá-la agora não teria efeito.",
+    footnote: "Quando a action existir, o Anotaí avisa aqui e a conexão passa a funcionar sem você refazer nada.",
+    brand: "Google",
+    connectable: false,
+  },
+  {
+    id: "notion",
+    name: "Notion",
+    tagline: "Mapeamento futuro: nenhuma automação escreve no Notion pela conexão desta tela.",
+    permission: "Ainda não há ação que crie páginas ou tasks no Notion por aqui. O Notion hoje é alcançável pelo catálogo MCP, em outra tela.",
+    footnote: "Quando a action existir, o Anotaí avisa aqui e a conexão passa a funcionar sem você refazer nada.",
+    brand: "Notion",
+    connectable: false,
   },
 ];
 
@@ -898,14 +924,21 @@ export default function Integrations() {
           {PROVIDERS.map((p) => {
             const conn = connectionOf(p.id);
             const busy = connecting === p.id || finalizing === p.id;
+            const upcoming = !p.connectable;
             return (
               <article className="card connection-card" key={p.id}>
                 <div className="connection-card-top">
-                  <span className="connection-logo connection-logo-google" aria-hidden="true">G</span>
+                  <span
+                    className={`connection-logo ${p.brand === "Notion" ? "connection-logo-notion" : "connection-logo-google"}`}
+                    aria-hidden="true"
+                  >{p.brand === "Notion" ? "N" : "G"}</span>
                   <div className="connection-card-title">
-                    <small>Google</small>
+                    <small>{p.brand}</small>
                     <h3>{p.name}</h3>
                   </div>
+                  {upcoming && !conn && (
+                    <span className="connection-beta">Em configuração</span>
+                  )}
                   {conn && conn.status === "active" && (
                     <span className="connection-connected">
                       <Icon name="check" size={13} /> {STATUS_LABELS[conn.status]}
@@ -923,7 +956,11 @@ export default function Integrations() {
                   </p>
                 )}
                 <div className="connection-card-footer">
-                  {conn?.status === "active" ? (
+                  {upcoming ? (
+                    <button className="btn-secondary" disabled style={{ width: "100%" }}>
+                      Indisponível por enquanto
+                    </button>
+                  ) : conn?.status === "active" ? (
                     <button className="btn-secondary" disabled={removing === conn.id}
                       onClick={() => void disconnect(conn)}>
                       {removing === conn.id ? "Desconectando…" : "Desconectar"}

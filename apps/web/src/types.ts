@@ -270,7 +270,7 @@ export interface PendencyFeed {
 
 /* ------------------------------------------------ integrações Google */
 
-export type IntegrationProvider = "google_gmail" | "google_calendar";
+export type IntegrationProvider = "google_gmail" | "google_calendar" | "google_sheets" | "notion";
 export type IntegrationStatus = "pending" | "active" | "error" | "disconnected";
 
 export interface IntegrationConnection {

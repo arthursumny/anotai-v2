@@ -19,12 +19,24 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CONFIG_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 _USER_TAG_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,200}$")
 _PARAM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,49}$")
+# `send` is its own alternative so a POST never rides on the message-id route;
+# everything else under messages/ stays a read-only id lookup.
 _GMAIL_PATH_RE = re.compile(
-    r"^gmail/v1/users/me/(?:profile|messages(?:/[A-Za-z0-9_-]+)?|labels(?:/[A-Za-z0-9_-]+)?|history|watch)$"
+    r"^gmail/v1/users/me/(?:profile|messages(?:/send|/[A-Za-z0-9_-]+)?|labels(?:/[A-Za-z0-9_-]+)?|history|watch)$"
 )
 _CALENDAR_PATH_RE = re.compile(
     r"^calendar/v3/calendars/(?:primary|[A-Za-z0-9@._-]{1,200})/events(?:/[A-Za-z0-9_-]{1,200})?$"
 )
+# Cada app não-Google entra com uma regex JUSTA do que a ação usa de fato.
+# Nunca um curinga: a allowlist existe para impedir que um caller aponte o proxy
+# para um endpoint arbitrário da conta do usuário. Adicionar app = uma linha aqui
+# e uma política de método explícita em `proxy_request`.
+_NOTION_PATH_RE = re.compile(r"^v1/pages$")
+_SLACK_PATH_RE = re.compile(r"^chat\.postMessage$")
+# Apps não-Google são somente POST: são endpoints de escrita, e uma variante de
+# leitura entra deliberadamente quando (e se) uma ação precisar dela.
+_POST_ONLY_PATH_RES = (_NOTION_PATH_RE, _SLACK_PATH_RE)
+_ALLOWED_PROXY_PATH_RES = (_GMAIL_PATH_RE, _CALENDAR_PATH_RE) + _POST_ONLY_PATH_RES
 _SENSITIVE_KEY_RE = re.compile(
     r"token|secret|password|credential|authorization|api[_-]?key|workspace.?id|user.?id|nango.?connection.?id",
     re.I,
@@ -263,15 +275,23 @@ class NangoClient:
             or ".." in path
             or "\\" in path
             or any(char in path for char in (":", "?", "#", "%", "//"))
-            or not (_GMAIL_PATH_RE.fullmatch(path) or _CALENDAR_PATH_RE.fullmatch(path))
+            or not any(regex.fullmatch(path) for regex in _ALLOWED_PROXY_PATH_RES)
         ):
-            raise ValueError("Proxy path Google não permitida")
+            raise ValueError("Proxy path não permitida")
         safe_id = self._connection_id(connection_id)
         provider_key = self._provider_config_key(provider_config_key)
         is_gmail_watch = path == "gmail/v1/users/me/watch"
+        is_gmail_send = path == "gmail/v1/users/me/messages/send"
         is_gmail_history = path == "gmail/v1/users/me/history"
-        if (path.startswith("gmail/") and ((is_gmail_watch and safe_method != "POST") or (not is_gmail_watch and safe_method != "GET"))):
-            raise ValueError("Método não permitido para este recurso Google")
+        if path.startswith("gmail/"):
+            gmail_post_route = is_gmail_watch or is_gmail_send
+            if (gmail_post_route and safe_method != "POST") or (
+                not gmail_post_route and safe_method != "GET"
+            ):
+                raise ValueError("Método não permitido para este recurso Google")
+        elif safe_method != "POST":
+            # Notion, Slack e qualquer app não-Google: somente escrita via POST.
+            raise ValueError("Método não permitido para este recurso")
         safe_params: dict[str, str | int | bool | Sequence[str]] = {}
         for key, value in (params or {}).items():
             is_page_token = isinstance(key, str) and key == "pageToken" and is_gmail_history

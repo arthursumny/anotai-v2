@@ -1,5 +1,6 @@
 """AnotAI — schemas de Template (Pydantic v2, tipagem estrita)."""
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -16,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-ActionType = Literal["telegram", "webhook", "mcp_tool", "email", "create_task"]
+ActionType = Literal["telegram", "webhook", "mcp_tool", "email", "create_task", "slack", "notion"]
 
 
 class _ActionProviderConfig(BaseModel):
@@ -40,6 +41,36 @@ class TelegramConfig(_ActionProviderConfig):
     message: StrictStr | None = None
     chat_id: StrictStr | None = None
     bot_token: StrictStr | None = None
+
+
+class SlackConfig(_ActionProviderConfig):
+    # O canal de destino é escolhido pelo dono do template (id do canal no
+    # Slack, ex.: C0123456789). Nunca vem do conteúdo gerado nem do LLM — é a
+    # barreira que impede uma nota de publicar num canal arbitrário.
+    channel: StrictStr = Field(min_length=1, max_length=64)
+    message: StrictStr = Field(default="{summary}", min_length=1, max_length=40000)
+
+
+class NotionConfig(_ActionProviderConfig):
+    # O database de destino e o mapeamento de propriedades são configuração do
+    # dono do template — nunca vêm do conteúdo gerado nem do LLM. É essa
+    # barreira que impede uma nota de gravar em database arbitrário do Notion.
+    database_id: StrictStr = Field(min_length=1, max_length=128)
+    # Template do título da página (mesmo estilo de EmailConfig.subject).
+    title: StrictStr = Field(default="{title}", min_length=1, max_length=300)
+    # Nome da propriedade-título no database (ex.: "Name", "Nome", "Título").
+    title_property: StrictStr = Field(default="Name", min_length=1, max_length=200)
+    # Valores já no formato da API do Notion, com placeholders interpoláveis
+    # (ex.: {"rich_text": [{"text": {"content": "{summary}"}}]}).
+    properties: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("database_id")
+    @classmethod
+    def _notion_database_id(cls, value: str) -> str:
+        # Somente o id do database (hex ou UUID com traços) — nunca uma URL.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise ValueError("database_id do Notion inválido")
+        return value
 
 
 class WebhookConfig(_ActionProviderConfig):
@@ -81,6 +112,8 @@ ACTION_CONFIG_MODELS = {
     "telegram": TelegramConfig,
     "webhook": WebhookConfig,
     "mcp_tool": MCPToolConfig,
+    "slack": SlackConfig,
+    "notion": NotionConfig,
 }
 
 

@@ -29,6 +29,8 @@ class WorkflowActionType(StrEnum):
     SEND_EMAIL = "SEND_EMAIL"
     SEND_WEBHOOK = "SEND_WEBHOOK"
     CALL_MCP_TOOL = "CALL_MCP_TOOL"
+    SEND_SLACK_MESSAGE = "SEND_SLACK_MESSAGE"
+    CREATE_NOTION_PAGE = "CREATE_NOTION_PAGE"
 
 
 class ActionValidationError(ValueError):
@@ -136,6 +138,32 @@ class CallMCPToolAction(_ActionBase):
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+class SendSlackMessageAction(_ActionBase):
+    """Posts to the channel fixed by the owned template, never a note-supplied one."""
+
+    type: Literal[WorkflowActionType.SEND_SLACK_MESSAGE] = WorkflowActionType.SEND_SLACK_MESSAGE
+    # Slack caps one text block at 30000 chars; 40000 keeps a whole message body
+    # comfortably inside one payload while staying bounded. The channel id is
+    # template config, never part of this action.
+    text: StrictStr = Field(min_length=1, max_length=40000)
+
+
+class CreateNotionPageAction(_ActionBase):
+    """Creates a page in the database fixed by the owned template.
+
+    The destination `database_id` and the property-name mapping (`title_property`
+    and the keys of `properties`) are template config and never part of this
+    action: note/LLM content cannot choose where the page is written in Notion.
+    `properties` holds already-rendered VALUES in Notion's own shape, so a note
+    supplies the content of a field, never its destination.
+    """
+
+    type: Literal[WorkflowActionType.CREATE_NOTION_PAGE] = WorkflowActionType.CREATE_NOTION_PAGE
+    title: StrictStr = Field(min_length=1, max_length=300)
+    # Notion-shaped property values, rendered from the template config.
+    properties: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 class CreateCalendarEventAction(_ActionBase):
     type: Literal[WorkflowActionType.CREATE_CALENDAR_EVENT] = WorkflowActionType.CREATE_CALENDAR_EVENT
     summary: StrictStr = Field(min_length=1, max_length=300)
@@ -187,6 +215,7 @@ def _parse_datetime(value):
 
 StructuredAction: TypeAlias = Annotated[
     CreateTaskAction | CreateReminderAction | SendTelegramAction | CreateCalendarEventAction | PipelineTriggerAction
-    | SendEmailAction | SendWebhookAction | CallMCPToolAction,
+    | SendEmailAction | SendWebhookAction | CallMCPToolAction | SendSlackMessageAction
+    | CreateNotionPageAction,
     Field(discriminator="type"),
 ]

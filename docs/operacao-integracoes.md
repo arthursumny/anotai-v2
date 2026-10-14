@@ -4,7 +4,18 @@ As credenciais OAuth de terceiros ficam no Nango, **não** no banco do Anotaí. 
 
 ## Nango
 
-1. Crie duas integrações no ambiente Nango escolhido: Gmail com `https://www.googleapis.com/auth/gmail.readonly`, e Agenda com `https://www.googleapis.com/auth/calendar.events`. Configure no painel do Nango as credenciais OAuth do aplicativo Google e os consentimentos/redirects que ele indicar. Os nomes das integrações devem coincidir com `NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY` e `NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY`.
+1. Crie uma integração por app no ambiente Nango escolhido. Os nomes das integrações devem coincidir com a respectiva chave de config no backend:
+
+   | App | Chave de config | Escopo OAuth que a integração precisa pedir |
+   |---|---|---|
+   | Gmail | `NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY` | `https://www.googleapis.com/auth/gmail.readonly` **+ um escopo que permita enviar**: `https://www.googleapis.com/auth/gmail.send` (ou `gmail.modify`) |
+   | Google Agenda | `NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY` | `https://www.googleapis.com/auth/calendar.events` |
+   | Google Planilhas | `NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY` | `https://www.googleapis.com/auth/spreadsheets` (+ `https://www.googleapis.com/auth/drive.file` se o Anotaí criar arquivos) — **ainda sem execução** |
+   | Notion | `NANGO_NOTION_PROVIDER_CONFIG_KEY` | OAuth próprio do Notion (não é escopo Google); conceda acesso às páginas/databases — **ainda sem execução** |
+
+   > **Gmail: sem o escopo de envio a ação `SEND_EMAIL` falha em runtime.** `gmail.readonly` sozinho lê, não envia. Se você já criou a integração Gmail só com leitura, precisa **recriá-la ou editar seus escopos no painel do Nango** e reconectar a conta do usuário. A listagem canônica de apps, capacidades e status é `app/services/provider_registry.py`.
+
+   Configure no painel do Nango as credenciais OAuth do aplicativoGoogle e os consentimentos/redirects que ele indicar.
 2. Configure no backend `NANGO_ENV_KEY` (chave **de ambiente**, com acesso a Connect Sessions/proxy/connections), `NANGO_BASE_URL` (por exemplo `https://api.nango.dev`), `NANGO_ENVIRONMENT` correspondente ao ambiente dos webhooks e `NANGO_SIGNING_KEY` (chave **de assinatura do webhook**, distinta da API key). Nunca publique essas chaves no frontend.
 3. No painel Nango, habilite o webhook de auth em `https://<api-publica>/api/v1/integrations/webhooks/nango` e o envio de eventos de criação. A API verifica `X-Nango-Hmac-Sha256` sobre os bytes originais, reconsulta a conexão no Nango e só a vincula após conferir as tags de usuário/workspace e a membership. Tokens OAuth não são copiados para o Anotaí.
 
@@ -15,6 +26,26 @@ As credenciais OAuth de terceiros ficam no Nango, **não** no banco do Anotaí. 
 3. Ao conectar Gmail, o acompanhamento **continua desligado**. Na tela Integrações, ative-o explicitamente e escolha remetentes/labels; o padrão é `INBOX`, com SPAM/TRASH ignorados. O worker registra/renova o watch com esse tópico. A notificação Pub/Sub só enfileira trabalho após verificar assinatura, audience, service account, conexão, watch e opt-in; o histórico do Gmail é a fonte de verdade.
 4. O watch expira: renovar pelo menos a cada sete dias (a implementação verifica diariamente); o worker também reconcilia histórico a cada 15 minutos em lotes para cobrir notificações perdidas. `expiration` vem em **epoch milissegundos**. Duplicatas são toleradas pelo ID externo por workspace/conexão.
 5. Se `history.list` retornar 404, a conexão exibe **lacuna de histórico** e pausa o processamento. Não fazemos leitura integral automática da caixa. O usuário pode aceitar explicitamente um novo baseline em Integrações; emails da lacuna **não são recuperados** por essa operação.
+
+## E-mail: sai da conta do usuário, não existe SMTP
+
+A ação `SEND_EMAIL` **não usa SMTP da plataforma**. Ela resolve a conexão Gmail ativa do próprio usuário (exigindo exatamente uma) e envia via proxy Nango em `gmail/v1/users/me/messages/send`, com a mensagem MIME completa em base64url. O remetente é a conta conectada — o Anotaí não falsifica um `From`.
+
+- Sem conta Gmail conectada: a ação falha com `Conecte seu Gmail para enviar email` e nada é enviado. **Não existe fallback** para outro transporte.
+- Sem `NANGO_ENV_KEY`/`NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY`: falha com `Gmail não está configurado`.
+- Duas conexões ativas para o mesmo usuário: falha por ambiguidade de identidade (a constraint `uq_integration_connection_owner_provider` mantém uma conexão por provedor por usuário justamente para isso).
+- O destinatário é o que a ação configurar; o `user.email` da conta Anotaí **não** é usado como remetente.
+- O `Message-ID` deriva da chave de idempotência da execução: uma tentativa repetida não gera outro e-mail.
+
+## Como adicionar um novo provedor
+
+1. Adicione uma linha em `PROVIDERS` em `app/services/provider_registry.py` (provider, `config_key_setting`, label, descrição, capacidades, nota de escopo e status).
+2. Amplie o CHECK `ck_integration_connection_provider` no modelo `app/models/integration_connection.py` **e** crie uma migration que dropa e recria a constraint pelo mesmo nome — isso só amplia o conjunto permitido, sem tocar em dados.
+3. Adicione a chave `NANGO_<APP>_PROVIDER_CONFIG_KEY` em `app/core/config.py` (default vazio = app desativado).
+4. Só então exponha conexão na tela de Integrações e implemente a execução. Enquanto a chave estiver vazia, o app aparece como indisponível em vez de oferecer um botão que quebraria no Nango.
+5. Atualize a tabela de escopos deste runbook.
+
+Regra: `ConnectableIntegrationProvider` em `app/schemas/integration.py` é o que a tela pode conectar **hoje**. Um provedor só entra nessa lista quando existe código de execução real — declarar no registro não é o mesmo que funcionar.
 
 ## Agenda e limites operacionais
 

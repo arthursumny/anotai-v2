@@ -45,6 +45,8 @@ def _provider_configs() -> dict[str, tuple[IntegrationProvider, str]]:
     return {
         "google_gmail": ("google_gmail", settings.NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY),
         "google_calendar": ("google_calendar", settings.NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY),
+        "slack": ("slack", settings.NANGO_SLACK_PROVIDER_CONFIG_KEY),
+        "notion": ("notion", settings.NANGO_NOTION_PROVIDER_CONFIG_KEY),
     }
 
 

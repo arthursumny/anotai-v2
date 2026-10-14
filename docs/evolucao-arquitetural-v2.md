@@ -111,7 +111,7 @@ Sob `app/models/`, `app/services/`, `app/api/v1/` e `app/schemas/` existentes: e
 
 ## 12. Integrações atuais
 
-*(histórico — o STT hoje é Soniox (não OpenAI), o email real é via SMTP e há Nango/Gmail/Calendar/Evolution GO implementados; ver "Estado atual" no topo e os runbooks `operacao-integracoes.md` / `operacao-whatsapp-evolution-go.md`.)*
+*(histórico — o STT hoje é Soniox (não OpenAI), o email real sai da conta Gmail do próprio usuário via Nango (sem SMTP), e há Nango/Gmail/Calendar/Evolution GO implementados; ver "Estado atual" no topo e os runbooks `operacao-integracoes.md` / `operacao-whatsapp-evolution-go.md`.)*
 
 Telegram bot, webhook HTTP e MCP (OAuth para serviços catalogados, servidor arbitrário, tools); OpenAI para STT/LLM. Ações `email` e `whatsapp` no dispatcher são stubs (`app/services/dispatcher.py:348-401`). Não há Nango, conexão Google via Nango, Gmail source, Google Calendar action ou Evolution GO implementados.
 

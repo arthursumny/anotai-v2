@@ -1,11 +1,12 @@
 """Template authorization, generated payloads, and real executor regressions."""
 
+import base64
 import json
-import threading
 import uuid
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,14 +15,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+import app.services.integration_service as integration_service
 from app.core.config import settings
 from app.models.action_execution import ActionExecution
 from app.models.action_item import Task
 from app.models.automation_settings import AutomationSettings
+from app.models.integration_connection import IntegrationConnection
 from app.models.note import Note, NoteStatus
 from app.models.template import Template
 from app.schemas.template import ActionConfig
 from app.services.action_executor import process_pending_actions, run_action_execution
+from app.services.nango_client import NangoClientError
 from app.services.template_actions import TemplateActionError, prepare_template_actions
 from tests.automation_helpers import persist_generation
 
@@ -45,47 +49,63 @@ def _factory(session):
 
 
 @pytest.fixture
-def smtp(monkeypatch):
-    captured = {"messages": [], "tls": [], "login": []}
+def gmail_send(monkeypatch):
+    """Stub the Nango Gmail proxy: no real Gmail/Nango API call ever happens."""
+    captured = {"messages": [], "error": None}
+    monkeypatch.setattr(settings, "NANGO_ENV_KEY", "nango-env-secret")
+    monkeypatch.setattr(settings, "NANGO_BASE_URL", "https://nango.example.test")
+    monkeypatch.setattr(settings, "NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY", "gmail-test-key")
 
-    class SMTPFake:
-        def __init__(self, host, port, timeout, **kwargs):
-            captured["connection"] = (host, port, timeout)
-            captured["thread"] = threading.get_ident()
-            captured["ssl"] = "context" in kwargs
+    class FakeNangoClient:
+        def __init__(self, *, api_key, base_url):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
 
-        def __enter__(self):
-            return self
+        async def proxy_request(self, method, path, **kwargs):
+            if captured["error"] is not None:
+                raise captured["error"]
+            captured["messages"].append({
+                "method": method,
+                "path": path,
+                "connection_id": kwargs["connection_id"],
+                "provider_config_key": kwargs["provider_config_key"],
+                "raw": kwargs["json_body"]["raw"],
+            })
+            return SimpleNamespace(
+                status_code=200, body={"id": "gmail_msg_1", "threadId": "thread_1"},
+            )
 
-        def __exit__(self, *_args):
-            return False
+    monkeypatch.setattr(integration_service, "NangoClient", FakeNangoClient)
 
-        def starttls(self, **kwargs):
-            captured["tls"].append(kwargs)
+    async def connect(session, user):
+        session.add(IntegrationConnection(
+            workspace_id=user.workspace_id,
+            user_id=user.id,
+            provider="google_gmail",
+            provider_config_key="gmail-test-key",
+            nango_connection_id="nango_conn_1",
+            status="active",
+        ))
+        await session.flush()
 
-        def login(self, username, password):
-            captured["login"].append((username, password))
-
-        def send_message(self, message, from_addr, to_addrs):
-            captured["messages"].append((message.as_bytes(), from_addr, to_addrs))
-            return {}
-
-    for key, value in {
-        "SMTP_HOST": "smtp.test", "SMTP_PORT": 587, "SMTP_TIMEOUT_SECONDS": 7,
-        "SMTP_FROM_EMAIL": "anotai@example.test", "SMTP_TLS": "starttls",
-        "SMTP_USERNAME": "smtp-user", "SMTP_PASSWORD": "smtp-secret",
-    }.items():
-        monkeypatch.setattr(settings, key, value)
-    monkeypatch.setattr("app.services.smtp_delivery.smtplib.SMTP", SMTPFake)
-    monkeypatch.setattr("app.services.smtp_delivery.smtplib.SMTP_SSL", SMTPFake)
+    captured["connect"] = connect
     return captured
 
 
-async def test_two_selected_templates_execute_only_their_own_actions(db_session, smtp):
+def _decode_mime(raw: str):
+    """Decode the Gmail base64url (unpadded) payload back into an email message."""
+    assert raw and "=" not in raw
+    padded = raw + "=" * (-len(raw) % 4)
+    return BytesParser(policy=policy.default).parsebytes(base64.urlsafe_b64decode(padded))
+
+
+async def test_two_selected_templates_execute_only_their_own_actions(db_session, gmail_send):
     # Given two templates owned by the same user but with different actions.
     email_note, email_template, user, _ = await _generation(db_session, [
         {"type": "email", "enabled": True, "config": {"subject": "{title}", "body": "{summary}\n{body}\n{client.name}"}},
     ], title="Email note", body="Email-only generated body")
+    await gmail_send["connect"](db_session, user)
+    await db_session.commit()
     task_note, task_template, _, _ = await _generation(db_session, [
         {"type": "create_task", "enabled": True, "config": {"title": "{title}", "summary": "{summary}"}},
     ], user_id=user.id, title="Task note")
@@ -100,34 +120,36 @@ async def test_two_selected_templates_execute_only_their_own_actions(db_session,
     assert result == {"succeeded": 2, "retry_scheduled": 0, "failed": 0, "skipped": 0}
     assert first[0].policy_snapshot["template_id"] == str(email_template.id)
     assert second[0].policy_snapshot["template_id"] == str(task_template.id)
-    assert len(smtp["messages"]) == 1
-    raw, sender, recipients = smtp["messages"][0]
-    message = BytesParser(policy=policy.default).parsebytes(raw)
+    assert len(gmail_send["messages"]) == 1
+    sent = gmail_send["messages"][0]
+    assert sent["method"] == "POST"
+    assert sent["path"] == "gmail/v1/users/me/messages/send"
+    assert sent["connection_id"] == "nango_conn_1"
+    assert sent["provider_config_key"] == "gmail-test-key"
+    message = _decode_mime(sent["raw"])
     assert message["Subject"] == email_note.title
-    assert recipients == [user.email] and sender == settings.SMTP_FROM_EMAIL
+    assert message["To"] == user.email
+    # The From header is never forged: the connected Gmail account is the sender.
+    assert message.get("From") is None
     assert message.get_content().splitlines() == ["Decisions", "Email-only generated body", "Ana"]
-    assert smtp["connection"] == ("smtp.test", 587, 7)
-    assert smtp["thread"] != threading.get_ident()
-    assert len(smtp["tls"]) == 1 and smtp["login"] == [("smtp-user", "smtp-secret")]
     assert [task.title for task in (await db_session.exec(select(Task))).all()] == ["Task note"]
     assert len((await db_session.exec(select(Note))).all()) == 2
 
 
-@pytest.mark.parametrize("tls", ["ssl", "none"])
-async def test_email_explicit_recipient_and_configurable_tls(db_session, smtp, tls, monkeypatch):
-    # Given an explicit user-configured recipient and TLS transport.
-    monkeypatch.setattr(settings, "SMTP_TLS", tls)
+async def test_email_explicit_recipient_reaches_the_mime_destination(db_session, gmail_send):
+    # Given an explicit user-configured recipient.
     note, _, user, _ = await _generation(db_session, [
         {"type": "email", "enabled": True, "config": {"to": "chosen@example.test"}},
     ])
+    await gmail_send["connect"](db_session, user)
     rows = await prepare_template_actions(db_session, note, user.id)
     await db_session.commit()
-    # When the executor sends through the SMTP adapter.
+    # When the executor sends through the user's own Gmail connection.
     result = await run_action_execution(_factory(db_session), rows[0].id)
-    # Then SMTP receives the explicit destination and requested transport.
+    # Then the proxied message addresses only the configured destination.
     assert result == "succeeded"
-    assert smtp["messages"][0][2] == ["chosen@example.test"]
-    assert smtp["ssl"] is (tls == "ssl") and smtp["tls"] == []
+    assert len(gmail_send["messages"]) == 1
+    assert _decode_mime(gmail_send["messages"][0]["raw"])["To"] == "chosen@example.test"
 
 
 async def test_task_retries_and_repeated_preparation_are_idempotent(db_session):
@@ -227,27 +249,29 @@ async def test_invalid_config_and_missing_variables_fail_without_blocking_siblin
     assert result["succeeded"] == 1
 
 
-async def test_smtp_failure_retries_without_regeneration_or_blocking_task(db_session, smtp, monkeypatch):
-    # Given a disconnected SMTP provider and an independent task action.
+async def test_gmail_proxy_failure_retries_without_regeneration_or_blocking_task(
+    db_session, gmail_send,
+):
+    # Given a failing Gmail proxy call and an independent task action.
     note, _, user, document = await _generation(db_session, [
         {"type": "email", "enabled": True, "config": {}},
         {"type": "create_task", "enabled": True, "config": {}},
     ])
+    await gmail_send["connect"](db_session, user)
     rows = await prepare_template_actions(db_session, note, user.id)
     await db_session.commit()
 
-    def disconnected(*_args, **_kwargs):
-        raise OSError("smtp-secret must not appear in ledger")
-
-    monkeypatch.setattr("app.services.integration_service.deliver_email", disconnected)
+    gmail_send["error"] = NangoClientError(502, "http_error")
     # When the executor handles provider failure in its own transaction.
     result = await process_pending_actions(_factory(db_session))
     # Then the task succeeds, the email can retry, and generation stays unchanged.
     assert result["retry_scheduled"] == result["succeeded"] == 1
     await db_session.refresh(rows[0])
     await db_session.refresh(document)
-    assert rows[0].last_error == "oserror" and rows[0].attempts == 1
+    assert rows[0].last_error == "integrationexecutionerror" and rows[0].attempts == 1
+    assert "http_error" not in (rows[0].last_error or "")
     assert document.rendered_content == note.body
+    assert gmail_send["messages"] == []
     assert len((await db_session.exec(select(Task))).all()) == 1
 
 
@@ -296,18 +320,19 @@ async def test_confirmation_uses_the_existing_ledger_and_executor(db_session):
     assert len((await db_session.exec(select(Task))).all()) == 1
 
 
-async def test_provider_receives_generated_braces_without_second_interpolation(db_session, smtp):
+async def test_provider_receives_generated_braces_without_second_interpolation(db_session, gmail_send):
     # Given generated text that itself contains placeholder-like text.
     note, _, user, _ = await _generation(db_session, [
         {"type": "email", "enabled": True, "config": {"body": "{body}"}},
     ], body="Literal {not_a_variable} in generated content")
+    await gmail_send["connect"](db_session, user)
     rows = await prepare_template_actions(db_session, note, user.id)
     await db_session.commit()
     # When sending the prepared content.
     result = await run_action_execution(_factory(db_session), rows[0].id)
     # Then generated braces stay literal, not missing-variable substitutions.
     assert result == "succeeded"
-    message = BytesParser(policy=policy.default).parsebytes(smtp["messages"][0][0])
+    message = _decode_mime(gmail_send["messages"][0]["raw"])
     assert message.get_content().strip() == note.body
 
 

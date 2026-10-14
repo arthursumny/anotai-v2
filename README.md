@@ -136,7 +136,11 @@ uvicorn app.main:app --reload
 `STT_PROVIDER=soniox|fake` (fake só em `ENV=dev|test`), `OPENAI_ROUTER_MODEL=gpt-4o-mini`,
 `OPENAI_EXTRACTOR_MODEL=gpt-4o`, `OPENAI_TRANSCRIPT_CHUNK_CHARS=24000`,
 `ROUTER_CONFIDENCE_THRESHOLD=0.6`, `MAX_AUDIO_MB`, `AUDIO_UPLOAD_DIR`,
-`SMTP_*` (host/porta/credenciais para a automação de email).
+`USER_SECRET_ENCRYPTION_KEY` (obrigatória — sem ela a migration de segredos aborta e a API não sobe).
+Integrações do usuário via Nango: `NANGO_ENV_KEY`, `NANGO_SIGNING_KEY`, `NANGO_BASE_URL`,
+`NANGO_ENVIRONMENT` e uma `NANGO_<APP>_PROVIDER_CONFIG_KEY` por app conectável. **Não existe SMTP**:
+o email das automações sai da conta Gmail que o próprio usuário conectou, e sem ela a ação
+`SEND_EMAIL` falha de forma explícita. Ver `docs/operacao-integracoes.md`.
 `ffmpeg` já vem no Dockerfile para Opus/WAV do BLE.
 
 ## App mobile

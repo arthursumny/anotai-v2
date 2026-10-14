@@ -16,7 +16,12 @@ class IntegrationConnection(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("workspace_id", "user_id", "provider", name="uq_integration_connection_owner_provider"),
         UniqueConstraint("provider_config_key", "nango_connection_id", name="uq_integration_connection_nango_binding"),
-        CheckConstraint("provider IN ('google_gmail', 'google_calendar')", name="ck_integration_connection_provider"),
+        # Valores permitidos espelham o registro em app/services/provider_registry.py;
+        # ampliar exige nova migration (drop + create do check, sem tocar em dados).
+        CheckConstraint(
+            "provider IN ('google_gmail', 'google_calendar', 'google_sheets', 'notion', 'slack')",
+            name="ck_integration_connection_provider",
+        ),
         CheckConstraint("status IN ('pending', 'active', 'error', 'disconnected')", name="ck_integration_connection_status"),
     )
 

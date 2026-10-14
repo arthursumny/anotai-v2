@@ -40,7 +40,7 @@ def test_registry_returns_typed_actions_and_parses_aware_local_datetime():
     assert isinstance(telegram, SendTelegramAction)
     assert set(ACTION_REGISTRY) == {
         "CREATE_TASK", "CREATE_REMINDER", "SEND_TELEGRAM", "CREATE_CALENDAR_EVENT", "PIPELINE_TRIGGER",
-        "SEND_EMAIL", "SEND_WEBHOOK", "CALL_MCP_TOOL",
+        "SEND_EMAIL", "SEND_WEBHOOK", "CALL_MCP_TOOL", "SEND_SLACK_MESSAGE", "CREATE_NOTION_PAGE",
     }
 
 

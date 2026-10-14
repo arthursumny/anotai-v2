@@ -7,14 +7,18 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, StrictBool
 
 
-IntegrationProvider = Literal["google_gmail", "google_calendar"]
+IntegrationProvider = Literal["google_gmail", "google_calendar", "google_sheets", "notion", "slack"]
+# Provedores que a tela de conexão pode abrir HOJE via POST /integrations/sessions
+# (os demais valores de IntegrationProvider ainda são somente mapeamento — ver
+# app/services/provider_registry.py).
+ConnectableIntegrationProvider = Literal["google_gmail", "google_calendar", "slack", "notion"]
 IntegrationStatus = Literal["pending", "active", "error", "disconnected"]
 
 
 class IntegrationSessionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider: IntegrationProvider
+    provider: ConnectableIntegrationProvider
 
 
 class IntegrationSessionRead(BaseModel):

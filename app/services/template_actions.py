@@ -30,6 +30,8 @@ _ACTION_TYPES = {
     "telegram": "SEND_TELEGRAM",
     "webhook": "SEND_WEBHOOK",
     "mcp_tool": "CALL_MCP_TOOL",
+    "slack": "SEND_SLACK_MESSAGE",
+    "notion": "CREATE_NOTION_PAGE",
 }
 
 
@@ -104,6 +106,16 @@ def _canonical_action(
             payload = {"body": render_action_value(body, context) if config.body is not None else body}
         case "mcp_tool":
             payload = {"arguments": render_action_value(config.arguments_mapping, context)}
+        case "slack":
+            payload = {"text": render_action_value(config.message, context)}
+        case "notion":
+            # database_id, title_property e as CHAVES de propriedade ficam na
+            # config (o executor os relê após revalidar a origem). Só os VALORES
+            # já renderizados entram no payload — mesmo padrão do email/webhook.
+            payload = {
+                "title": render_action_value(config.title, context),
+                "properties": render_action_value(config.properties, context),
+            }
     return validate_action(
         {"type": _ACTION_TYPES[configured.type], **payload}, template_authorized=True,
     )

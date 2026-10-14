@@ -32,14 +32,6 @@ class Settings(BaseSettings):
     SONIOX_API_BASE_URL: str = "https://api.soniox.com"
     SONIOX_STT_TIMEOUT_SECONDS: float = Field(default=900, gt=0)
     SONIOX_STT_POLL_INTERVAL_SECONDS: float = Field(default=1, gt=0)
-    SMTP_HOST: str = ""
-    SMTP_PORT: int = Field(default=587, ge=1, le=65535)
-    SMTP_USERNAME: str = ""
-    SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = ""
-    SMTP_TLS: Literal["starttls", "ssl", "none"] = "starttls"
-    SMTP_TIMEOUT_SECONDS: float = Field(default=15, gt=0)
-
     ROUTER_CONFIDENCE_THRESHOLD: float = 0.6
     FOLLOW_UP_DELAY_HOURS: int = Field(default=24, ge=1, le=168)
     DEFAULT_TIMEZONE: str = "America/Sao_Paulo"
@@ -74,6 +66,12 @@ class Settings(BaseSettings):
     NANGO_ENVIRONMENT: str = ""
     NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY: str = ""
     NANGO_GOOGLE_CALENDAR_PROVIDER_CONFIG_KEY: str = ""
+    # Identifica a config de integração do Nango para o Google Sheets.
+    NANGO_GOOGLE_SHEETS_PROVIDER_CONFIG_KEY: str = ""
+    # Identifica a config de integração do Nango para o Notion.
+    NANGO_NOTION_PROVIDER_CONFIG_KEY: str = ""
+    # Identifica a config de integração do Nango para o Slack.
+    NANGO_SLACK_PROVIDER_CONFIG_KEY: str = ""
     GMAIL_PUBSUB_TOPIC: str = ""
     GMAIL_PUSH_AUDIENCE: str = ""
     GMAIL_PUSH_SA_EMAIL: str = ""

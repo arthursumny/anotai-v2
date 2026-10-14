@@ -1,5 +1,6 @@
 """HTTP-mocked contract tests for the pure Nango adapter."""
 
+import base64
 import json
 
 import httpx
@@ -218,6 +219,60 @@ async def test_proxy_calendar_post_and_no_external_or_path_injection():
     }
 
 
+async def test_gmail_messages_send_is_post_only_and_accepts_raw_payload():
+    captured = []
+
+    def handler(request: httpx.Request):
+        captured.append(request)
+        return httpx.Response(200, json={"id": "msg-123", "threadId": "thread-1"})
+
+    client, http = _client(handler)
+    try:
+        raw = base64.urlsafe_b64encode(
+            b"To: dest@example.test\r\nSubject: hi\r\n\r\nHello"
+        ).rstrip(b"=").decode("ascii")
+        response = await client.proxy_request(
+            "POST",
+            "gmail/v1/users/me/messages/send",
+            connection_id="conn_123",
+            provider_config_key="google-mail",
+            json_body={"raw": raw},
+        )
+        assert response.body == {"id": "msg-123", "threadId": "thread-1"}
+
+        # POST is allowed on send only: reads stay GET, message ids stay read-only.
+        for method, bad_path in (
+            ("GET", "gmail/v1/users/me/messages/send"),
+            ("POST", "gmail/v1/users/me/messages/msg-123"),
+            ("POST", "gmail/v1/users/me/profile"),
+            ("POST", "gmail/v1/users/me/history"),
+            ("POST", "gmail/v1/users/me/messages/send/../send"),
+        ):
+            with pytest.raises(ValueError, match="path|Método"):
+                await client.proxy_request(
+                    method, bad_path, connection_id="conn_123", provider_config_key="google-mail"
+                )
+        # The credential guard still rejects credential-shaped raw payloads.
+        with pytest.raises(ValueError, match="Proxy body"):
+            await client.proxy_request(
+                "POST",
+                "gmail/v1/users/me/messages/send",
+                connection_id="conn_123",
+                provider_config_key="google-mail",
+                json_body={"raw": "token=abc123"},
+            )
+    finally:
+        await http.aclose()
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.method == "POST"
+    assert request.url.path == "/proxy/gmail/v1/users/me/messages/send"
+    assert json.loads(request.content) == {"raw": raw}
+    assert request.headers["Connection-Id"] == "conn_123"
+    assert request.headers["Provider-Config-Key"] == "google-mail"
+
+
 async def test_gmail_history_list_allows_only_get_and_supported_pagination_params():
     captured = []
 
@@ -259,6 +314,70 @@ async def test_gmail_history_list_allows_only_get_and_supported_pagination_param
     assert captured[0].url.params["startHistoryId"] == "100"
     assert captured[0].url.params["pageToken"] == "opaque/page+token"
     assert captured[0].url.params.get_list("historyTypes") == ["messageAdded", "labelRemoved"]
+
+
+async def test_proxy_paths_are_allowlisted_per_provider_and_post_only():
+    """Só endpoints usados de fato passam; o resto é barrado na validação.
+
+    A allowlist é por provedor (regex justa) e não-Google é somente POST. Isso
+    impede que um caller aponte o proxy para um endpoint arbitrário da conta do
+    usuário — inclusive em apps já conectados.
+    """
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append(request)
+        return httpx.Response(200, json={"id": "page_1"})
+
+    client, http = _client(handler)
+    try:
+        await client.proxy_request(
+            "POST", "v1/pages", connection_id="conn_123", provider_config_key="notion",
+        )
+        await client.proxy_request(
+            "POST", "chat.postMessage", connection_id="conn_123", provider_config_key="slack",
+        )
+        assert len(seen) == 2
+        assert seen[0].url.path == "/proxy/v1/pages"
+        assert seen[1].url.path == "/proxy/chat.postMessage"
+        assert seen[0].headers["Connection-Id"] == "conn_123"
+        assert seen[1].headers["Provider-Config-Key"] == "slack"
+    finally:
+        await http.aclose()
+
+    # Nao-Google e somente escrita: GET numa rota de criacao nao passa.
+    with pytest.raises(ValueError, match="Método"):
+        await _client(lambda _r: httpx.Response(200, json={}))[0].proxy_request(
+            "GET", "v1/pages", connection_id="conn_123", provider_config_key="notion",
+        )
+
+    # Endpoint do mesmo app que a acao nao usa: barrado.
+    for method, path in (
+        ("POST", "v1/blocks/abc/children"),
+        ("POST", "v1/databases"),
+        ("POST", "chat.postEphemeral"),
+        ("POST", "conversations.list"),
+    ):
+        with pytest.raises(ValueError, match="Proxy path"):
+            await _client(lambda _r: httpx.Response(200, json={}))[0].proxy_request(
+                method, path, connection_id="conn_123", provider_config_key="cfg",
+            )
+
+
+async def test_notion_body_rejects_credential_like_values_without_weakening_guard():
+    """O guard de corpo continua fail-closed: credenciais em valores não passam."""
+    client, http = _client(lambda _r: httpx.Response(200, json={}))
+    try:
+        with pytest.raises(ValueError, match="credencial"):
+            await client.proxy_request(
+                "POST",
+                "v1/pages",
+                connection_id="conn_123",
+                provider_config_key="notion",
+                json_body={"parent": {"database_id": "db_1"}, "properties": {"note": "token=abc123"}},
+            )
+    finally:
+        await http.aclose()
 
 
 async def test_http_errors_are_sanitized_and_delete_uses_backend_bearer():

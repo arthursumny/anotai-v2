@@ -6,6 +6,7 @@ ledger transaction later rolls back, a retry may send the same message again.
 This service never commits or changes the ledger status.
 """
 
+import base64
 import hashlib
 import re
 import uuid
@@ -16,8 +17,8 @@ from email.utils import formatdate
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import anyio
 import httpx
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -30,7 +31,7 @@ from app.models.integration_connection import IntegrationConnection
 from app.models.user import User
 from app.models.workflow import Workflow, WorkflowExecution, WorkflowStep
 from app.models.workspace import Workspace, WorkspaceMembership
-from app.schemas.template import ActionConfig
+from app.schemas.template import ActionConfig, NotionConfig, SlackConfig
 from app.schemas.workflow_action import (
     ActionValidationError,
     SendEmailAction,
@@ -44,7 +45,6 @@ from app.services.dispatcher import (
     resolve_secrets_in_config,
 )
 from app.services.nango_client import NangoClient, NangoClientError
-from app.services.smtp_delivery import deliver_email
 from app.services.template_actions import TemplateActionError, validate_template_origin
 
 
@@ -98,7 +98,15 @@ class IntegrationService:
         if execution.action_type == WorkflowActionType.CREATE_CALENDAR_EVENT.value:
             return await self._create_calendar_event(session, execution, action)
         if execution.action_type == WorkflowActionType.SEND_EMAIL.value:
-            return await self._send_email(execution, user, action)
+            return await self._send_email(session, execution, user, action)
+        if execution.action_type == WorkflowActionType.SEND_SLACK_MESSAGE.value:
+            if template_origin is None:
+                raise IntegrationExecutionError("Slack exige um template configurado")
+            return await self._send_slack_message(session, execution, action, template_origin[0])
+        if execution.action_type == WorkflowActionType.CREATE_NOTION_PAGE.value:
+            if template_origin is None:
+                raise IntegrationExecutionError("Notion exige um template configurado")
+            return await self._create_notion_page(session, execution, action, template_origin[0])
         if template_origin is not None:
             configured, note, document = template_origin
             if execution.action_type == WorkflowActionType.SEND_WEBHOOK.value:
@@ -330,24 +338,60 @@ class IntegrationService:
         return {"status_code": response.status_code}
 
     async def _send_email(
-        self, execution: ActionExecution, user: User, action: SendEmailAction,
-    ) -> dict[str, str]:
+        self, session: AsyncSession, execution: ActionExecution, user: User, action: SendEmailAction,
+    ) -> dict[str, str | None]:
         recipient = action.to or user.email
         SendEmailAction._single_mailbox(recipient)
-        sender = settings.SMTP_FROM_EMAIL
-        if not settings.SMTP_HOST or not sender:
-            raise IntegrationExecutionError("SMTP não configurado")
-        SendEmailAction._single_mailbox(sender)
+        provider_key = settings.NANGO_GOOGLE_GMAIL_PROVIDER_CONFIG_KEY
+        if not settings.NANGO_ENV_KEY or not provider_key:
+            raise IntegrationExecutionError("Gmail não está configurado")
+        connections = list((await session.exec(select(IntegrationConnection).where(
+            IntegrationConnection.workspace_id == execution.workspace_id,
+            IntegrationConnection.user_id == execution.user_id,
+            IntegrationConnection.provider == "google_gmail",
+            IntegrationConnection.provider_config_key == provider_key,
+            IntegrationConnection.status == "active",
+        ))).all())
+        if len(connections) != 1:
+            raise IntegrationExecutionError("Conecte seu Gmail para enviar email")
+        connection = connections[0]
+        # The sender is the connected Gmail account: Google derives the From
+        # header from the OAuth identity, so none is forged here.
         message_id = f"<{self._idempotency_key(execution, 'email').rsplit(':', 1)[-1]}@anotai>"
         message = EmailMessage(policy=SMTP)
-        message["From"] = sender
         message["To"] = recipient
         message["Subject"] = action.subject
         message["Date"] = formatdate(usegmt=True)
         message["Message-ID"] = message_id
         message.set_content(action.body)
-        await anyio.to_thread.run_sync(deliver_email, message, sender, recipient)
-        return {"message_id": message_id}
+        # Gmail's messages.send expects the RFC 2822 bytes base64url-encoded
+        # without padding.
+        raw = base64.urlsafe_b64encode(message.as_bytes()).rstrip(b"=").decode("ascii")
+        try:
+            nango = NangoClient(
+                api_key=settings.NANGO_ENV_KEY,
+                base_url=settings.NANGO_BASE_URL or "https://api.nango.dev",
+            )
+            response = await nango.proxy_request(
+                "POST",
+                "gmail/v1/users/me/messages/send",
+                connection_id=connection.nango_connection_id,
+                provider_config_key=connection.provider_config_key,
+                json_body={"raw": raw},
+            )
+        except (NangoClientError, ValueError):
+            raise IntegrationExecutionError("Gmail request falhou") from None
+        body = response.body
+        sent_id = body.get("id") if isinstance(body, dict) else None
+        thread_id = body.get("threadId") if isinstance(body, dict) else None
+        if not isinstance(sent_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", sent_id):
+            raise IntegrationExecutionError("Gmail retornou mensagem inválida")
+        if thread_id is not None and (
+            not isinstance(thread_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", thread_id)
+        ):
+            raise IntegrationExecutionError("Gmail retornou mensagem inválida")
+        return {"entity": "email", "id": sent_id, "thread_id": thread_id}
 
     async def _create_calendar_event(
         self, session: AsyncSession, execution: ActionExecution, action: Any,
@@ -396,3 +440,104 @@ class IntegrationService:
         if not isinstance(event_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", event_id):
             raise IntegrationExecutionError("Google Calendar retornou evento inválido")
         return {"entity": "calendar_event", "id": event_id}
+
+    async def _send_slack_message(
+        self, session: AsyncSession, execution: ActionExecution, action: Any, configured: ActionConfig,
+    ) -> dict[str, str]:
+        provider_key = settings.NANGO_SLACK_PROVIDER_CONFIG_KEY
+        if not settings.NANGO_ENV_KEY or not provider_key:
+            raise IntegrationExecutionError("Slack não está configurado")
+        connections = list((await session.exec(select(IntegrationConnection).where(
+            IntegrationConnection.workspace_id == execution.workspace_id,
+            IntegrationConnection.user_id == execution.user_id,
+            IntegrationConnection.provider == "slack",
+            IntegrationConnection.provider_config_key == provider_key,
+            IntegrationConnection.status == "active",
+        ))).all())
+        if len(connections) != 1:
+            raise IntegrationExecutionError("Conecte seu Slack para enviar mensagens")
+        connection = connections[0]
+        # The destination channel is the template owner's configuration, never
+        # note/LLM content: a generated note cannot pick an arbitrary channel.
+        try:
+            channel = SlackConfig.model_validate(configured.config).channel
+        except ValidationError:
+            raise IntegrationExecutionError("Slack sem canal configurado") from None
+        try:
+            nango = NangoClient(
+                api_key=settings.NANGO_ENV_KEY,
+                base_url=settings.NANGO_BASE_URL or "https://api.nango.dev",
+            )
+            response = await nango.proxy_request(
+                "POST",
+                "chat.postMessage",
+                connection_id=connection.nango_connection_id,
+                provider_config_key=connection.provider_config_key,
+                json_body={"channel": channel, "text": action.text},
+            )
+        except (NangoClientError, ValueError):
+            raise IntegrationExecutionError("Slack request falhou") from None
+        body = response.body
+        ok = body.get("ok") if isinstance(body, dict) else None
+        if ok is not True:
+            raise IntegrationExecutionError("Slack recusou a mensagem")
+        ts = body.get("ts") if isinstance(body, dict) else None
+        channel_id = body.get("channel") if isinstance(body, dict) else None
+        if not isinstance(ts, str) or not re.fullmatch(r"[0-9]{10}(\.[0-9]{1,6})?", ts):
+            raise IntegrationExecutionError("Slack retornou mensagem inválida")
+        if not isinstance(channel_id, str) or not re.fullmatch(r"[A-Za-z0-9]{1,64}", channel_id):
+            raise IntegrationExecutionError("Slack retornou mensagem inválida")
+        return {"entity": "slack_message", "ts": ts, "channel": channel_id}
+
+    async def _create_notion_page(
+        self, session: AsyncSession, execution: ActionExecution, action: Any, configured: ActionConfig,
+    ) -> dict[str, str]:
+        provider_key = settings.NANGO_NOTION_PROVIDER_CONFIG_KEY
+        if not settings.NANGO_ENV_KEY or not provider_key:
+            raise IntegrationExecutionError("Notion não está configurado")
+        connections = list((await session.exec(select(IntegrationConnection).where(
+            IntegrationConnection.workspace_id == execution.workspace_id,
+            IntegrationConnection.user_id == execution.user_id,
+            IntegrationConnection.provider == "notion",
+            IntegrationConnection.provider_config_key == provider_key,
+            IntegrationConnection.status == "active",
+        ))).all())
+        if len(connections) != 1:
+            raise IntegrationExecutionError("Conecte seu Notion para criar páginas")
+        connection = connections[0]
+        # The destination database and the property-name mapping are the template
+        # owner's configuration, never note/LLM content: a generated note cannot
+        # choose which Notion database receives the page. The property VALUES are
+        # already rendered by `_canonical_action`, like every other action here.
+        try:
+            notion_config = NotionConfig.model_validate(configured.config)
+        except ValidationError:
+            raise IntegrationExecutionError("Notion sem database configurado") from None
+        payload = {
+            "parent": {"database_id": notion_config.database_id},
+            "properties": {
+                notion_config.title_property: {
+                    "title": [{"text": {"content": action.title}}],
+                },
+                **action.properties,
+            },
+        }
+        try:
+            nango = NangoClient(
+                api_key=settings.NANGO_ENV_KEY,
+                base_url=settings.NANGO_BASE_URL or "https://api.nango.dev",
+            )
+            response = await nango.proxy_request(
+                "POST",
+                "v1/pages",
+                connection_id=connection.nango_connection_id,
+                provider_config_key=connection.provider_config_key,
+                json_body=payload,
+            )
+        except (NangoClientError, ValueError):
+            raise IntegrationExecutionError("Notion request falhou") from None
+        body = response.body
+        page_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(page_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", page_id):
+            raise IntegrationExecutionError("Notion retornou página inválida")
+        return {"entity": "notion_page", "id": page_id}

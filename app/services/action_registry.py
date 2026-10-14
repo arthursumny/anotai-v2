@@ -7,10 +7,12 @@ from app.schemas.workflow_action import (
     ActionValidationError,
     CallMCPToolAction,
     CreateCalendarEventAction,
+    CreateNotionPageAction,
     CreateReminderAction,
     CreateTaskAction,
     PipelineTriggerAction,
     SendEmailAction,
+    SendSlackMessageAction,
     SendTelegramAction,
     SendWebhookAction,
     StructuredAction,
@@ -26,6 +28,8 @@ ACTION_REGISTRY = MappingProxyType({
     WorkflowActionType.SEND_EMAIL.value: SendEmailAction,
     WorkflowActionType.SEND_WEBHOOK.value: SendWebhookAction,
     WorkflowActionType.CALL_MCP_TOOL.value: CallMCPToolAction,
+    WorkflowActionType.SEND_SLACK_MESSAGE.value: SendSlackMessageAction,
+    WorkflowActionType.CREATE_NOTION_PAGE.value: CreateNotionPageAction,
 })
 
 
