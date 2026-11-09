@@ -123,8 +123,28 @@ services:
         condition: service_healthy
     expose:
       - "80"
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+      - traefik.http.routers.anotai-web.rule=Host(`anotai.sumny.tech`)
+      - traefik.http.routers.anotai-web.entrypoints=web
+      - traefik.http.routers.anotai-web.service=anotai-web
+      - traefik.http.routers.anotai-web.middlewares=redirect-to-https@file
+      - traefik.http.services.anotai-web.loadbalancer.server.port=80
+      - traefik.http.routers.anotai-websecure.rule=Host(`anotai.sumny.tech`)
+      - traefik.http.routers.anotai-websecure.entrypoints=websecure
+      - traefik.http.routers.anotai-websecure.service=anotai-websecure
+      - traefik.http.routers.anotai-websecure.tls.certresolver=letsencrypt
+      - traefik.http.services.anotai-websecure.loadbalancer.server.port=80
 
 volumes:
   pgdata:
   redisdata:
   audio:
+
+networks:
+  dokploy-network:
+    external: true
