@@ -5,6 +5,7 @@ import type { Note } from "../types";
 import Icon from "../components/Icon";
 
 type Phase = "idle" | "recording" | "uploading" | "transcribing" | "done" | "attention";
+type AudioSource = "mic" | "display";
 
 function pickMime(): string {
   if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
@@ -20,6 +21,7 @@ const RANK: Record<Phase, number> = { idle: 0, recording: 0, uploading: 1, trans
 
 export default function Record() {
   const [phase, setPhase] = useState<Phase>("idle");
+  const [source, setSource] = useState<AudioSource>("mic");
   const [elapsed, setElapsed] = useState(0);
   const [note, setNote] = useState<Note | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,9 +48,18 @@ export default function Record() {
     try { audioCtxRef.current?.close(); } catch { /* noop */ }
     audioCtxRef.current = null;
     analyserRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current?.getTracks().forEach((t) => {
+      t.onended = null;
+      t.stop();
+    });
     streamRef.current = null;
     setLevel(0);
+  };
+
+  const stop = () => {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    recRef.current?.stop();
+    recRef.current = null;
   };
 
   useEffect(() => () => { stopTimers(); stopAudioGraph(); }, []);
@@ -170,63 +181,105 @@ export default function Record() {
   const start = async () => {
     setError(null);
     setNote(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+    let stream: MediaStream;
+
+    if (source === "display") {
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== "function") {
+        setError("Seu navegador não permite capturar áudio do sistema. Use Chrome ou Edge no computador.");
+        return;
+      }
       try {
-        const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const actx = new AC();
-        audioCtxRef.current = actx;
-        const src = actx.createMediaStreamSource(stream);
-        const analyser = actx.createAnalyser();
-        analyser.fftSize = 2048;
-        src.connect(analyser);
-        analyserRef.current = analyser;
-      } catch { /* waveform cai p/ modo simulado */ }
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        displayStream.getVideoTracks().forEach((vt) => {
+          vt.stop();
+          displayStream.removeTrack(vt);
+        });
 
-      const mime = pickMime();
-      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-      chunksRef.current = [];
-      rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      rec.onstop = async () => {
-        if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-        try { audioCtxRef.current?.close(); } catch { /* noop */ }
-        audioCtxRef.current = null;
-        analyserRef.current = null;
-        stream.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-
-        const type = rec.mimeType || "audio/webm";
-        const blob = new Blob(chunksRef.current, { type });
-        if (blob.size < 2048 || !(await hasSound(blob))) {
-          setError("Nenhum som captado — confira se o microfone está ativo e com volume, e grave de novo.");
-          setPhase("idle");
+        const audioTracks = displayStream.getAudioTracks();
+        if (audioTracks.length === 0) {
+          displayStream.getTracks().forEach((t) => t.stop());
+          setError("Nenhum áudio compartilhado — marque a opção de compartilhar áudio da aba/janela e tente de novo.");
           return;
         }
-        setPhase("uploading");
-        try {
-          const ext = type.includes("webm") ? "webm" : "bin";
-          const accepted = await uploadAudio(blob, `gravacao-${Date.now()}.${ext}`);
-          pollUntilDone(accepted.note_id);
-        } catch (e) {
-          setError(apiError(e));
-          setPhase("idle");
-        }
-      };
-      rec.start();
-      recRef.current = rec;
-      setElapsed(0);
-      setPhase("recording");
-      timerRef.current = window.setInterval(() => setElapsed((s) => s + 1), 1000);
-    } catch {
-      setError("Permissão de microfone negada ou indisponível (use http://localhost ou HTTPS).");
-    }
-  };
 
-  const stop = () => {
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    recRef.current?.stop();
-    recRef.current = null;
+        audioTracks.forEach((track) => {
+          track.onended = () => {
+            if (recRef.current) {
+              stop();
+            }
+          };
+        });
+
+        stream = displayStream;
+      } catch (err: unknown) {
+        const isCancel = err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "AbortError");
+        if (!isCancel) {
+          setError("Permissão para capturar áudio cancelada ou não concedida.");
+        }
+        return;
+      }
+    } else {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch {
+        setError("Permissão de microfone negada ou indisponível (use http://localhost ou HTTPS).");
+        return;
+      }
+    }
+
+    streamRef.current = stream;
+    try {
+      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const actx = new AC();
+      audioCtxRef.current = actx;
+      const src = actx.createMediaStreamSource(stream);
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      src.connect(analyser);
+      analyserRef.current = analyser;
+    } catch { /* waveform cai p/ modo simulado */ }
+
+    const mime = pickMime();
+    const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    chunksRef.current = [];
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+    rec.onstop = async () => {
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      try { audioCtxRef.current?.close(); } catch { /* noop */ }
+      audioCtxRef.current = null;
+      analyserRef.current = null;
+      stream.getTracks().forEach((t) => {
+        t.onended = null;
+        t.stop();
+      });
+      streamRef.current = null;
+
+      const type = rec.mimeType || "audio/webm";
+      const blob = new Blob(chunksRef.current, { type });
+      if (blob.size < 2048 || !(await hasSound(blob))) {
+        setError(
+          source === "display"
+            ? "Nenhum som captado — confira se a aba/janela está reproduzindo som e grave de novo."
+            : "Nenhum som captado — confira se o microfone está ativo e com volume, e grave de novo."
+        );
+        setPhase("idle");
+        return;
+      }
+      setPhase("uploading");
+      try {
+        const ext = type.includes("webm") ? "webm" : "bin";
+        const accepted = await uploadAudio(blob, `gravacao-${Date.now()}.${ext}`);
+        pollUntilDone(accepted.note_id);
+      } catch (e) {
+        setError(apiError(e));
+        setPhase("idle");
+      }
+    };
+    rec.start();
+    recRef.current = rec;
+    setElapsed(0);
+    setPhase("recording");
+    timerRef.current = window.setInterval(() => setElapsed((s) => s + 1), 1000);
   };
 
   const reset = () => {
@@ -244,11 +297,13 @@ export default function Record() {
   const progress = phase === "uploading" ? 32 : phase === "transcribing" ? 72 : phase === "done" ? 100 : 0;
 
   const headline =
-    phase === "recording" ? "Ouvindo você…" :
+    phase === "recording" ? (source === "display" ? "Gravando áudio do sistema…" : "Ouvindo você…") :
     phase === "uploading" ? "Enviando…" :
     phase === "transcribing" ? "Preparando sua nota…" :
     phase === "done" ? "Sua nota está pronta." :
-    phase === "attention" ? "Não foi possível concluir." : "Toque para registrar algo que você quer lembrar.";
+    phase === "attention" ? "Não foi possível concluir." :
+    source === "display" ? "Toque para gravar o áudio de uma aba ou janela do computador." :
+    "Toque para registrar algo que você quer lembrar.";
 
   return (
     <div>
@@ -263,6 +318,35 @@ export default function Record() {
       </div>
 
       <div className={`rec-stage ${isRec ? "is-recording" : ""}`}>
+        <div className="rec-source-picker" role="radiogroup" aria-label="Fonte do áudio">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={source === "mic"}
+            className={`btn ${source === "mic" ? "" : "btn-secondary"}`}
+            onClick={() => setSource("mic")}
+            disabled={isRec || busyPhase}
+          >
+            Microfone
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={source === "display"}
+            className={`btn ${source === "display" ? "" : "btn-secondary"}`}
+            onClick={() => setSource("display")}
+            disabled={isRec || busyPhase}
+          >
+            Áudio do PC / aba
+          </button>
+        </div>
+
+        {source === "display" && (
+          <div className="rec-display-hint">
+            Dica: marque a caixa &ldquo;Compartilhar áudio da aba&rdquo; (Chrome/Edge).
+          </div>
+        )}
+
         <div className="rec-control">
           <button
             className={`recbtn ${isRec ? "recording" : ""}`}
@@ -281,7 +365,11 @@ export default function Record() {
         </div>
         <p className="muted rec-hint" role="status" aria-live="polite" style={{ marginBottom: 0 }}>
           {isRec
-            ? level > 0.08 ? "Gravando. Toque no botão quando terminar." : "Gravando. Se estiver silencioso, aproxime-se do microfone."
+            ? level > 0.08
+              ? "Gravando. Toque no botão quando terminar."
+              : source === "display"
+                ? "Gravando áudio do PC / aba. Toque no botão quando terminar."
+                : "Gravando. Se estiver silencioso, aproxime-se do microfone."
             : headline}
         </p>
 
