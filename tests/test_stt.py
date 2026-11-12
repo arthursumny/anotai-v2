@@ -81,7 +81,12 @@ async def test_transcribe_uploads_full_audio_and_retrieves_final_text(audio_path
     assert requests[0].headers["content-type"].startswith("multipart/form-data; boundary=")
     assert b'name="file"; filename="recording.ogg"' in requests[0].content
     assert b"test-audio" in requests[0].content
-    assert json.loads(requests[1].content) == {"model": "stt-async-v5", "file_id": FILE_ID}
+    assert json.loads(requests[1].content) == {
+        "model": "stt-async-v5",
+        "file_id": FILE_ID,
+        "enable_speaker_diarization": True,
+        "language_hints": ["pt", "en"],
+    }
 
 
 @pytest.mark.asyncio
@@ -333,6 +338,7 @@ def test_factory_defaults_to_soniox_configuration_and_requires_its_key(monkeypat
         STT_PROVIDER="soniox", ENV="prod", SONIOX_API_KEY="test-key",
         SONIOX_STT_MODEL="custom-model", SONIOX_API_BASE_URL="https://soniox.test",
         SONIOX_STT_TIMEOUT_SECONDS=25, SONIOX_STT_POLL_INTERVAL_SECONDS=2,
+        SONIOX_ENABLE_DIARIZATION=True, SONIOX_LANGUAGE_HINTS="pt,en",
     )
     monkeypatch.setattr(stt, "settings", config)
 
@@ -344,6 +350,8 @@ def test_factory_defaults_to_soniox_configuration_and_requires_its_key(monkeypat
     assert adapter._model == "custom-model"
     assert adapter._timeout == 25
     assert adapter._poll_interval == 2
+    assert adapter._enable_diarization is True
+    assert adapter._language_hints == ["pt", "en"]
     config.SONIOX_API_KEY = ""
     with pytest.raises(STTError, match="SONIOX_API_KEY"):
         stt.get_stt_provider()
@@ -356,3 +364,65 @@ def test_unknown_provider_never_falls_back(monkeypatch):
     # When / Then
     with pytest.raises(STTError, match="não suportado"):
         stt.get_stt_provider()
+
+
+@pytest.mark.asyncio
+async def test_transcribe_formats_tokens_with_alternating_speakers(audio_path: Path):
+    # Given: tokens com speakers alternados
+    transcript_payload = {
+        "text": "Texto bruto ignorado quando tokens com speaker estão presentes",
+        "tokens": [
+            {"text": "  Olá ", "speaker": "1"},
+            {"text": "doutor,", "speaker": "1"},
+            {"text": "  tudo ", "speaker": "1"},
+            {"text": "bem? ", "speaker": "1"},
+            {"text": " Tudo", "speaker": "2"},
+            {"text": " ótimo, ", "speaker": "2"},
+            {"text": "como ", "speaker": "2"},
+            {"text": "  vai? ", "speaker": "2"},
+            {"text": " Vou", "speaker": "1"},
+            {"text": " muito", "speaker": "1"},
+            {"text": " bem.", "speaker": "1"},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"{JOB_PATH}/transcript":
+            return httpx.Response(200, json=transcript_payload)
+        return completed_response(request)
+
+    # When
+    result = await provider(handler).transcribe(audio_path)
+
+    # Then
+    expected = (
+        "Falante 1: Olá doutor, tudo bem?\n\n"
+        "Falante 2: Tudo ótimo, como vai?\n\n"
+        "Falante 1: Vou muito bem."
+    )
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_transcribe_tokens_without_speaker_falls_back_to_text(audio_path: Path):
+    # Given: tokens sem speaker caem no fallback usando o campo text
+    transcript_payload = {
+        "text": "  Transcrição original usando fallback do campo text.  ",
+        "tokens": [
+            {"text": "Transcrição", "speaker": None},
+            {"text": " original", "speaker": None},
+            {"text": " usando"},
+            {"text": " fallback"},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"{JOB_PATH}/transcript":
+            return httpx.Response(200, json=transcript_payload)
+        return completed_response(request)
+
+    # When
+    result = await provider(handler).transcribe(audio_path)
+
+    # Then
+    assert result == "Transcrição original usando fallback do campo text."

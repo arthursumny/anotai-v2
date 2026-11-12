@@ -1,9 +1,10 @@
 """AnotAI — STT via Soniox assíncrono; fake exclusivo para dev/testes."""
 
+import re
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Literal, Protocol, assert_never
+from typing import Any, Literal, Protocol, assert_never
 from uuid import UUID
 
 import anyio
@@ -45,10 +46,64 @@ class _TranscriptionStatus(BaseModel):
     status: Literal["queued", "processing", "completed", "error"]
 
 
-class _Transcript(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class _Token(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore", coerce_numbers_to_str=True)
 
     text: str
+    speaker: str | None = None
+
+
+class _Transcript(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    text: str = ""
+    tokens: list[_Token] = []
+
+
+def _format_transcript(transcript: _Transcript) -> str:
+    has_speaker = any(
+        token.speaker is not None and token.speaker.strip() != ""
+        for token in transcript.tokens
+    )
+    if not has_speaker:
+        text = transcript.text.strip()
+        if not text:
+            raise STTError("Soniox retornou transcrição vazia")
+        return text
+
+    blocks: list[str] = []
+    current_speaker: str | None = None
+    current_tokens: list[str] = []
+
+    def flush_block() -> None:
+        if current_speaker is not None and current_tokens:
+            raw_text = "".join(current_tokens)
+            cleaned = re.sub(r" +", " ", raw_text).strip()
+            if cleaned:
+                speaker_label = (
+                    current_speaker
+                    if current_speaker.startswith("Falante ")
+                    else f"Falante {current_speaker}"
+                )
+                blocks.append(f"{speaker_label}: {cleaned}")
+
+    for token in transcript.tokens:
+        spk = token.speaker.strip() if token.speaker else current_speaker
+        if spk is None:
+            continue
+        if spk != current_speaker:
+            flush_block()
+            current_speaker = spk
+            current_tokens = [token.text]
+        else:
+            current_tokens.append(token.text)
+
+    flush_block()
+
+    final_text = "\n\n".join(blocks).strip()
+    if not final_text:
+        raise STTError("Soniox retornou transcrição vazia")
+    return final_text
 
 
 class SonioxSTT:
@@ -62,6 +117,8 @@ class SonioxSTT:
         base_url: str | None = None,
         timeout_seconds: float | None = None,
         poll_interval_seconds: float | None = None,
+        enable_speaker_diarization: bool | None = None,
+        language_hints: list[str] | str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         poll_wait: Callable[[float], Awaitable[None]] = anyio.sleep,
     ) -> None:
@@ -75,6 +132,20 @@ class SonioxSTT:
             settings.SONIOX_STT_POLL_INTERVAL_SECONDS
             if poll_interval_seconds is None else poll_interval_seconds
         )
+        self._enable_diarization = (
+            getattr(settings, "SONIOX_ENABLE_DIARIZATION", True)
+            if enable_speaker_diarization is None
+            else enable_speaker_diarization
+        )
+        raw_hints = (
+            getattr(settings, "SONIOX_LANGUAGE_HINTS", "pt,en")
+            if language_hints is None
+            else language_hints
+        )
+        if isinstance(raw_hints, str):
+            self._language_hints = [h.strip() for h in raw_hints.split(",") if h.strip()]
+        else:
+            self._language_hints = [h.strip() for h in raw_hints if h.strip()]
         self._transport = transport
         self._poll_wait = poll_wait
         if not self._api_key:
@@ -102,9 +173,14 @@ class SonioxSTT:
                         )
                     response.raise_for_status()
                     file_id = str(_RemoteResource.model_validate_json(response.content).id)
-                    response = await client.post(
-                        "v1/transcriptions", json={"model": self._model, "file_id": file_id}
-                    )
+                    transcription_payload: dict[str, Any] = {
+                        "model": self._model,
+                        "file_id": file_id,
+                        "enable_speaker_diarization": self._enable_diarization,
+                    }
+                    if self._language_hints:
+                        transcription_payload["language_hints"] = self._language_hints
+                    response = await client.post("v1/transcriptions", json=transcription_payload)
                     response.raise_for_status()
                     transcription_id = str(_RemoteResource.model_validate_json(response.content).id)
                     while True:
@@ -123,10 +199,8 @@ class SonioxSTT:
                                 assert_never(unreachable)
                     response = await client.get(f"v1/transcriptions/{transcription_id}/transcript")
                     response.raise_for_status()
-                    text = _Transcript.model_validate_json(response.content).text.strip()
-                    if not text:
-                        raise STTError("Soniox retornou transcrição vazia")
-                    return text
+                    transcript = _Transcript.model_validate_json(response.content)
+                    return _format_transcript(transcript)
             except STTError as exc:
                 error = exc
                 raise

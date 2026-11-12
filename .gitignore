@@ -5,3 +5,4 @@ apps/web/node_modules/
 apps/mobile/node_modules/
 __pycache__/
 .pytest_cache/
+.venv/
