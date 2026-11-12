@@ -212,9 +212,30 @@ code { padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; back
 .rec-source-picker .btn {
   min-height: 38px; padding: 8px 16px; border-radius: 999px; font-size: 13px;
 }
+.rec-mic-toggle {
+  position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 8px;
+  margin: -8px 0 12px; padding: 6px 14px; border: 1px solid #dce8e1; border-radius: 999px;
+  background: #f6faf7; color: #314438; font-size: 13px; font-weight: 500; cursor: pointer; user-select: none;
+  transition: background .15s ease, border-color .15s ease;
+}
+.rec-mic-toggle:hover:not(.disabled) {
+  background: #edf5f0; border-color: #c8ddd0;
+}
+.rec-mic-toggle.disabled {
+  opacity: .6; cursor: not-allowed; pointer-events: none;
+}
+.rec-mic-toggle input[type="checkbox"] {
+  display: inline-block; width: 16px; height: 16px; min-height: 16px; margin: 0; padding: 0;
+  cursor: pointer; accent-color: var(--green);
+}
 .rec-display-hint {
-  position: relative; z-index: 2; margin: -10px 0 20px; padding: 7px 14px; border: 1px solid #dce6dd; border-radius: 10px;
+  position: relative; z-index: 2; margin: 0 0 20px; padding: 7px 14px; border: 1px solid #dce6dd; border-radius: 10px;
   background: #f5f8f5; color: #4e6454; font-size: 12px; line-height: 1.45; text-align: center; max-width: 440px;
+}
+.rec-warning {
+  position: relative; z-index: 2; margin: 10px 0 4px; padding: 6px 14px; border: 1px solid #efdfad;
+  border-radius: 999px; background: #fbf3de; color: #805719; font-size: 12px; line-height: 1.45;
+  text-align: center; max-width: 440px;
 }
 .rec-rings { position: relative; display: grid; width: 220px; height: 220px; place-items: center; }
 .ring { position: absolute; inset: 0; border: 1.5px solid rgba(22, 131, 106, .24); border-radius: 50%; opacity: 0; pointer-events: none; }

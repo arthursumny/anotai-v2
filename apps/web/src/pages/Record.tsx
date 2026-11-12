@@ -22,9 +22,11 @@ const RANK: Record<Phase, number> = { idle: 0, recording: 0, uploading: 1, trans
 export default function Record() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [source, setSource] = useState<AudioSource>("mic");
+  const [includeMic, setIncludeMic] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [note, setNote] = useState<Note | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [level, setLevel] = useState(0);
 
   const recRef = useRef<MediaRecorder | null>(null);
@@ -32,6 +34,8 @@ export default function Record() {
   const timerRef = useRef<number | null>(null);
   const pollRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const displayStreamRef = useRef<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -43,26 +47,55 @@ export default function Record() {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   };
 
+  const stopAllTracks = () => {
+    const stopStream = (s: MediaStream | null) => {
+      if (!s) return;
+      s.getTracks().forEach((t) => {
+        t.onended = null;
+        try { t.stop(); } catch { /* noop */ }
+      });
+    };
+
+    stopStream(displayStreamRef.current);
+    displayStreamRef.current = null;
+
+    stopStream(micStreamRef.current);
+    micStreamRef.current = null;
+
+    stopStream(streamRef.current);
+    streamRef.current = null;
+  };
+
   const stopAudioGraph = () => {
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     try { audioCtxRef.current?.close(); } catch { /* noop */ }
     audioCtxRef.current = null;
     analyserRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => {
-      t.onended = null;
-      t.stop();
-    });
-    streamRef.current = null;
+    stopAllTracks();
     setLevel(0);
   };
 
   const stop = () => {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    recRef.current?.stop();
-    recRef.current = null;
+    if (recRef.current && recRef.current.state !== "inactive") {
+      try { recRef.current.stop(); } catch { /* noop */ }
+      recRef.current = null;
+    } else {
+      recRef.current = null;
+      stopAudioGraph();
+    }
   };
 
-  useEffect(() => () => { stopTimers(); stopAudioGraph(); }, []);
+  useEffect(() => () => {
+    stopTimers();
+    if (recRef.current && recRef.current.state !== "inactive") {
+      recRef.current.onstop = null;
+      recRef.current.ondataavailable = null;
+      try { recRef.current.stop(); } catch { /* noop */ }
+    }
+    recRef.current = null;
+    stopAudioGraph();
+  }, []);
 
   /* Desenha a waveform viva no canvas */
   useEffect(() => {
@@ -180,37 +213,18 @@ export default function Record() {
 
   const start = async () => {
     setError(null);
+    setWarning(null);
     setNote(null);
-    let stream: MediaStream;
+    let streamToRecord: MediaStream;
 
     if (source === "display") {
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== "function") {
         setError("Seu navegador não permite capturar áudio do sistema. Use Chrome ou Edge no computador.");
         return;
       }
+      let displayStream: MediaStream;
       try {
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-        displayStream.getVideoTracks().forEach((vt) => {
-          vt.stop();
-          displayStream.removeTrack(vt);
-        });
-
-        const audioTracks = displayStream.getAudioTracks();
-        if (audioTracks.length === 0) {
-          displayStream.getTracks().forEach((t) => t.stop());
-          setError("Nenhum áudio compartilhado — marque a opção de compartilhar áudio da aba/janela e tente de novo.");
-          return;
-        }
-
-        audioTracks.forEach((track) => {
-          track.onended = () => {
-            if (recRef.current) {
-              stop();
-            }
-          };
-        });
-
-        stream = displayStream;
+        displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       } catch (err: unknown) {
         const isCancel = err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "AbortError");
         if (!isCancel) {
@@ -218,41 +232,149 @@ export default function Record() {
         }
         return;
       }
+
+      displayStream.getVideoTracks().forEach((vt) => {
+        vt.stop();
+        displayStream.removeTrack(vt);
+      });
+
+      const audioTracks = displayStream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        displayStream.getTracks().forEach((t) => t.stop());
+        setError("Nenhum áudio compartilhado — marque a opção de compartilhar áudio da aba/janela e tente de novo.");
+        return;
+      }
+
+      displayStreamRef.current = displayStream;
+
+      audioTracks.forEach((track) => {
+        track.onended = () => {
+          if (recRef.current) {
+            stop();
+          }
+        };
+      });
+
+      let micStream: MediaStream | null = null;
+      if (includeMic) {
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function") {
+          try {
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            micStreamRef.current = micStream;
+          } catch {
+            setWarning("Microfone não disponível — gravando só o áudio da aba");
+            micStream = null;
+            micStreamRef.current = null;
+          }
+        } else {
+          setWarning("Microfone não disponível — gravando só o áudio da aba");
+        }
+      }
+
+      if (displayStream.getAudioTracks().every((t) => t.readyState === "ended")) {
+        stopAllTracks();
+        return;
+      }
+
+      if (micStream) {
+        try {
+          const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+          const actx = new AC();
+          audioCtxRef.current = actx;
+          if (actx.state === "suspended") {
+            await actx.resume();
+          }
+
+          const displaySource = actx.createMediaStreamSource(displayStream);
+          const micSource = actx.createMediaStreamSource(micStream);
+          const mixer = actx.createGain();
+          const destination = actx.createMediaStreamDestination();
+
+          displaySource.connect(mixer);
+          micSource.connect(mixer);
+          mixer.connect(destination);
+
+          const analyser = actx.createAnalyser();
+          analyser.fftSize = 2048;
+          mixer.connect(analyser);
+          analyserRef.current = analyser;
+
+          streamToRecord = destination.stream;
+        } catch {
+          if (micStream) {
+            micStream.getTracks().forEach((t) => {
+              t.onended = null;
+              try { t.stop(); } catch { /* noop */ }
+            });
+            micStreamRef.current = null;
+            micStream = null;
+          }
+          setWarning("Microfone não disponível — gravando só o áudio da aba");
+          streamToRecord = displayStream;
+        }
+      } else {
+        try {
+          const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+          const actx = new AC();
+          audioCtxRef.current = actx;
+          if (actx.state === "suspended") {
+            await actx.resume();
+          }
+
+          const src = actx.createMediaStreamSource(displayStream);
+          const analyser = actx.createAnalyser();
+          analyser.fftSize = 2048;
+          src.connect(analyser);
+          analyserRef.current = analyser;
+        } catch {
+          /* waveform cai p/ modo simulado */
+        }
+        streamToRecord = displayStream;
+      }
     } else {
+      let micStream: MediaStream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch {
         setError("Permissão de microfone negada ou indisponível (use http://localhost ou HTTPS).");
         return;
       }
+      micStreamRef.current = micStream;
+      streamToRecord = micStream;
+
+      try {
+        const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const actx = new AC();
+        audioCtxRef.current = actx;
+        if (actx.state === "suspended") {
+          await actx.resume();
+        }
+
+        const src = actx.createMediaStreamSource(micStream);
+        const analyser = actx.createAnalyser();
+        analyser.fftSize = 2048;
+        src.connect(analyser);
+        analyserRef.current = analyser;
+      } catch {
+        /* waveform cai p/ modo simulado */
+      }
     }
 
-    streamRef.current = stream;
-    try {
-      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const actx = new AC();
-      audioCtxRef.current = actx;
-      const src = actx.createMediaStreamSource(stream);
-      const analyser = actx.createAnalyser();
-      analyser.fftSize = 2048;
-      src.connect(analyser);
-      analyserRef.current = analyser;
-    } catch { /* waveform cai p/ modo simulado */ }
+    streamRef.current = streamToRecord;
 
     const mime = pickMime();
-    const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    let rec: MediaRecorder;
+    try {
+      rec = mime ? new MediaRecorder(streamToRecord, { mimeType: mime }) : new MediaRecorder(streamToRecord);
+    } catch {
+      stopAudioGraph();
+      setError("Não foi possível iniciar o gravador de áudio no seu navegador.");
+      return;
+    }
     chunksRef.current = [];
     rec.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     rec.onstop = async () => {
-      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-      try { audioCtxRef.current?.close(); } catch { /* noop */ }
-      audioCtxRef.current = null;
-      analyserRef.current = null;
-      stream.getTracks().forEach((t) => {
-        t.onended = null;
-        t.stop();
-      });
-      streamRef.current = null;
+      stopAudioGraph();
 
       const type = rec.mimeType || "audio/webm";
       const blob = new Blob(chunksRef.current, { type });
@@ -275,7 +397,13 @@ export default function Record() {
         setPhase("idle");
       }
     };
-    rec.start();
+    try {
+      rec.start();
+    } catch {
+      stopAudioGraph();
+      setError("Não foi possível iniciar a gravação.");
+      return;
+    }
     recRef.current = rec;
     setElapsed(0);
     setPhase("recording");
@@ -284,8 +412,10 @@ export default function Record() {
 
   const reset = () => {
     stopTimers();
+    stopAudioGraph();
     setNote(null);
     setError(null);
+    setWarning(null);
     setElapsed(0);
     setPhase("idle");
   };
@@ -324,7 +454,11 @@ export default function Record() {
             role="radio"
             aria-checked={source === "mic"}
             className={`btn ${source === "mic" ? "" : "btn-secondary"}`}
-            onClick={() => setSource("mic")}
+            onClick={() => {
+              setSource("mic");
+              setError(null);
+              setWarning(null);
+            }}
             disabled={isRec || busyPhase}
           >
             Microfone
@@ -334,12 +468,28 @@ export default function Record() {
             role="radio"
             aria-checked={source === "display"}
             className={`btn ${source === "display" ? "" : "btn-secondary"}`}
-            onClick={() => setSource("display")}
+            onClick={() => {
+              setSource("display");
+              setError(null);
+              setWarning(null);
+            }}
             disabled={isRec || busyPhase}
           >
             Áudio do PC / aba
           </button>
         </div>
+
+        {source === "display" && (
+          <label className={`rec-mic-toggle ${isRec || busyPhase ? "disabled" : ""}`}>
+            <input
+              type="checkbox"
+              checked={includeMic}
+              onChange={(e) => setIncludeMic(e.target.checked)}
+              disabled={isRec || busyPhase}
+            />
+            <span>Incluir meu microfone</span>
+          </label>
+        )}
 
         {source === "display" && (
           <div className="rec-display-hint">
@@ -372,6 +522,12 @@ export default function Record() {
                 : "Gravando. Se estiver silencioso, aproxime-se do microfone."
             : headline}
         </p>
+
+        {warning && (
+          <div className="rec-warning" role="status">
+            {warning}
+          </div>
+        )}
 
         {(isRec || elapsed > 0) && phase !== "idle" && (
           <canvas ref={canvasRef} className="wave-canvas" width={520} height={84} />
