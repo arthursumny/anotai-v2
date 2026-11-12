@@ -3,10 +3,11 @@
 import uuid
 from unittest.mock import AsyncMock
 
+import httpx
 from sqlmodel import select
 
 import app.services.note_pipeline as pipeline
-import app.worker as worker
+from app import worker
 from app.models.action_execution import ActionExecution
 from app.models.action_item import Task
 from app.models.execution_log import ExecutionLog
@@ -119,3 +120,67 @@ async def test_document_write_failure_never_marks_note_processed_or_runs_actions
     assert list((await worker_db.exec(select(GeneratedDocument))).all()) == []
     assert list((await worker_db.exec(select(ActionExecution))).all()) == []
     assert len(list((await worker_db.exec(select(ExecutionLog))).all())) == 1
+
+
+async def test_llm_failure_degrades_gracefully_saving_raw_transcription(
+    worker_db, tmp_path, monkeypatch, openai_stub,
+):
+    workspace, user, note, _ = await _audio_scope(worker_db)
+    long_first_line = "Reunião de alinhamento com cliente sobre cronograma de entrega da fase dois do sistema"
+    transcript = f"{long_first_line}\nDefinido envio até sexta-feira."
+    _install_stt(monkeypatch, transcript)
+    openai_stub(
+        httpx.Response(429, json={"error": {"message": "insufficient_quota", "type": "insufficient_quota"}}),
+    )
+    tool_executor = AsyncMock()
+    monkeypatch.setattr(pipeline, "execute_template_tools", tool_executor)
+
+    result = await worker.process_audio_job({}, str(note.id), str(tmp_path / "audio.wav"), str(user.id))
+    assert result["ok"] is True
+    assert result["status"] == "general"
+
+    saved = await worker_db.get(Note, note.id)
+    document = (await worker_db.exec(select(GeneratedDocument))).one()
+    event = (await worker_db.exec(select(NormalizedEvent))).one()
+
+    assert saved.status == NoteStatus.PROCESSED
+    assert saved.title == long_first_line[:80]
+    assert len(saved.title) == 80
+    assert saved.body == transcript
+    assert saved.summary == "Resumo indisponível: falha na IA"
+    assert saved.template_id is None
+    assert saved.structured_data["tipo"] == "transcricao_bruta"
+    assert "Falha na OpenAI" in saved.structured_data["motivo"]
+    assert len(saved.structured_data["motivo"]) <= 200
+    assert document.workspace_id == workspace.id
+    assert document.rendered_content == transcript
+    assert event.content == transcript
+    assert tool_executor.await_count == 0
+
+
+async def test_llm_extraction_failure_with_template_degrades_without_running_tools(
+    worker_db, tmp_path, monkeypatch, openai_stub,
+):
+    _, user, note, template = await _audio_scope(worker_db, with_template=True)
+    transcript = "Pauta da reunião semanal.\nItens discutidos."
+    _install_stt(monkeypatch, transcript)
+    openai_stub(
+        {"template_id": str(template.id), "confidence": 0.95, "reason": "matched"},
+        httpx.Response(429, json={"error": {"message": "rate_limit", "type": "rate_limit_error"}}),
+    )
+    tool_executor = AsyncMock()
+    monkeypatch.setattr(pipeline, "execute_template_tools", tool_executor)
+
+    result = await worker.process_audio_job({}, str(note.id), str(tmp_path / "audio.wav"), str(user.id))
+    assert result["ok"] is True
+
+    saved = await worker_db.get(Note, note.id)
+    assert saved.status == NoteStatus.PROCESSED
+    assert saved.title == "Pauta da reunião semanal."
+    assert saved.body == transcript
+    assert saved.template_id is None
+    assert saved.structured_data == {
+        "tipo": "transcricao_bruta",
+        "motivo": "Falha na OpenAI ao gerar o documento completo",
+    }
+    assert tool_executor.await_count == 0

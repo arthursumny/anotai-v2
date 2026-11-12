@@ -1,7 +1,7 @@
 """The single recording/document flow shared by processing and manual retries."""
 
 import logging
-from datetime import timezone
+from datetime import UTC, datetime
 
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -12,9 +12,9 @@ from app.models.user import User
 from app.models.workspace import WorkspaceMembership
 from app.services.document_pipeline import process_generated_note
 from app.services.event_ingestion import EventCandidate, ingest
-from app.services.extractor import generate_note
-from app.services.general_note import generate_general_note
-from app.services.router import route_transcription
+from app.services.extractor import ExtractionError, generate_note
+from app.services.general_note import GeneralNoteError, generate_general_note
+from app.services.router import RouterError, route_transcription
 from app.services.trigger_executor import execute_template_tools
 from app.services.workflow_engine import prepare_template_actions
 
@@ -45,7 +45,7 @@ async def process_transcription(
                 user_id=user.id,
                 source="audio",
                 type="AUDIO_TRANSCRIBED",
-                occurred_at=note.created_at.replace(tzinfo=timezone.utc)
+                occurred_at=note.created_at.replace(tzinfo=UTC)
                 if note.created_at.tzinfo is None else note.created_at,
                 content=note.raw_transcription,
                 external_id=str(note.id),
@@ -56,19 +56,47 @@ async def process_transcription(
             templates = list((await session.exec(
                 select(Template).where(Template.user_id == note.user_id)
             )).all())
-            routing = await route_transcription(note.raw_transcription, templates)
-            template = next((item for item in templates if item.id == routing.template_id), None)
-        generated = await generate_note(note.raw_transcription, template) if template else (
-            await generate_general_note(note.raw_transcription)
-        )
-        note.title = generated.title
-        note.body = generated.body
-        note.summary = generated.summary
-        note.template_id = template.id if template else None
-        note.structured_data = generated.data if template else {
-            "tipo": "nota_geral", "nota": generated.body,
-        }
-        note.status = NoteStatus.PROCESSED
+        else:
+            templates = []
+        try:
+            if template is None:
+                routing = await route_transcription(note.raw_transcription, templates)
+                template = next((item for item in templates if item.id == routing.template_id), None)
+            generated = await generate_note(note.raw_transcription, template) if template else (
+                await generate_general_note(note.raw_transcription)
+            )
+            note.title = generated.title
+            note.body = generated.body
+            note.summary = generated.summary
+            note.template_id = template.id if template else None
+            note.structured_data = generated.data if template else {
+                "tipo": "nota_geral", "nota": generated.body,
+            }
+            note.status = NoteStatus.PROCESSED
+        except (GeneralNoteError, ExtractionError, RouterError) as exc:
+            reason = str(exc)[:200]
+            logger.warning(
+                "Falha na geração via IA para a nota %s; salvando transcrição bruta: %s",
+                note.id,
+                reason,
+            )
+            first_line = next(
+                (line.strip() for line in note.raw_transcription.splitlines() if line.strip()),
+                "",
+            )
+            note.title = (
+                first_line[:80]
+                if first_line
+                else f"Transcrição de {datetime.now().astimezone().strftime('%d/%m/%Y %H:%M')}"
+            )
+            note.body = note.raw_transcription
+            note.summary = "Resumo indisponível: falha na IA"
+            note.template_id = None
+            note.structured_data = {
+                "tipo": "transcricao_bruta",
+                "motivo": reason,
+            }
+            note.status = NoteStatus.PROCESSED
         session.add(note)
         await session.flush()
     await process_generated_note(session, note.id, note.user_id)
@@ -77,13 +105,14 @@ async def process_transcription(
     await session.commit()
     # A execução das ferramentas de integração é best-effort: uma falha de
     # tool/LLM/credencial NUNCA pode quebrar o fluxo gravação→nota.
-    try:
-        await execute_template_tools(
-            session,
-            user_id=note.user_id,
-            template_id=note.template_id,
-            transcription=note.raw_transcription,
-            note_body=note.body or "",
-        )
-    except Exception:
-        logger.exception("Falha ao executar as ferramentas de integração da nota")
+    if note.template_id is not None:
+        try:
+            await execute_template_tools(
+                session,
+                user_id=note.user_id,
+                template_id=note.template_id,
+                transcription=note.raw_transcription,
+                note_body=note.body or "",
+            )
+        except Exception:
+            logger.exception("Falha ao executar as ferramentas de integração da nota")
