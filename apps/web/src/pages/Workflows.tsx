@@ -7,6 +7,7 @@ import {
   getLocalization,
   getWorkflowSettings,
   listIntegrationConnections,
+  listTemplates,
   listWorkflowExecutions,
   listWorkflows,
   putWorkflowSettings,
@@ -16,6 +17,7 @@ import type {
   ActionExecution,
   AutomationMode,
   AutomationSettings,
+  Template,
   Workflow,
   WorkflowStep,
 } from "../types";
@@ -226,8 +228,10 @@ export default function Workflows() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [trigger, setTrigger] = useState("DOCUMENT_GENERATED");
-  // Condições não têm editor visual ainda: preservadas sem mexer no save.
+  // Condições são preservadas sem mexer no save; o seletor "Modelo" edita só conditions.source.
   const [conditions, setConditions] = useState<Record<string, unknown>>({});
+  // Modelos do usuário para o filtro "nota do modelo X" (trigger DOCUMENT_GENERATED).
+  const [templates, setTemplates] = useState<Template[]>([]);
   const [wfEnabled, setWfEnabled] = useState(false);
   const [steps, setSteps] = useState<StepDef[]>([]);
   const [saving, setSaving] = useState(false);
@@ -240,14 +244,16 @@ export default function Workflows() {
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [wfs, st, execs, conns, loc] = await Promise.all([
+      const [wfs, st, execs, conns, loc, tpls] = await Promise.all([
         listWorkflows(),
         getWorkflowSettings().catch(() => null),
         listWorkflowExecutions().catch(() => [] as ActionExecution[]),
         listIntegrationConnections().catch(() => []),
         getLocalization().catch(() => null),
+        listTemplates().catch(() => [] as Template[]),
       ]);
       setItems(wfs);
+      setTemplates(tpls);
       setExecutions(execs);
       setCalendarReady(conns.some((c) => c.provider === "google_calendar" && c.status === "active"));
       setWsTz(loc?.timezone || null);
@@ -300,6 +306,18 @@ export default function Workflows() {
       if (i < 0 || j < 0 || j >= l.length) return l;
       const next = [...l];
       [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+
+  /** Modelo escolhido no seletor; "" = "Qualquer modelo" (condição não enviada). */
+  const conditionSource = typeof conditions.source === "string" ? conditions.source : "";
+
+  /** Edita só conditions.source, preservando as demais condições existentes. */
+  const setConditionSource = (value: string) =>
+    setConditions((c) => {
+      const next = { ...c };
+      if (value) next.source = value;
+      else delete next.source;
       return next;
     });
 
@@ -356,11 +374,15 @@ export default function Workflows() {
     }
     setSaving(true);
     try {
+      // conditions.source só filtra o gatilho "nota pronta"; nos demais ele
+      // deixaria o fluxo sem correspondência, então não é enviado.
+      const conditionsToSend = { ...conditions };
+      if (trigger !== "DOCUMENT_GENERATED") delete conditionsToSend.source;
       const body = {
         title: title.trim(),
         description: description.trim(),
         trigger_type: trigger,
-        conditions,
+        conditions: conditionsToSend,
         enabled: wfEnabled,
         steps: steps.map((s, i) => stepToApi(s, i)),
       };
@@ -585,6 +607,26 @@ export default function Workflows() {
               <option key={t.value} value={t.value} disabled={!t.ready}>{t.label}</option>
             ))}
           </select>
+
+          {trigger === "DOCUMENT_GENERATED" && (
+            <>
+              <label>Este fluxo roda para notas de qual modelo?</label>
+              <select value={conditionSource} onChange={(e) => setConditionSource(e.target.value)}>
+                <option value="">Qualquer modelo</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>{t.title}</option>
+                ))}
+                {conditionSource && !templates.some((t) => t.id === conditionSource) && (
+                  <option value={conditionSource}>Modelo atual (não encontrado na lista)</option>
+                )}
+              </select>
+              <p className="muted" style={{ margin: "4px 0 0" }}>
+                {conditionSource
+                  ? "Só notas geradas com este modelo iniciam o fluxo; notas de outros modelos e notas gerais ficam de fora."
+                  : "Qualquer nota que ficar pronta inicia o fluxo, inclusive notas gerais (sem modelo)."}
+              </p>
+            </>
+          )}
 
           <label style={{ marginTop: 16 }}>O que acontece, em ordem?</label>
           <p className="muted" style={{ marginTop: 0 }}>

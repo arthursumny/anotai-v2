@@ -16,7 +16,7 @@ from app.services.extractor import ExtractionError, generate_note
 from app.services.general_note import GeneralNoteError, generate_general_note
 from app.services.router import RouterError, route_transcription
 from app.services.trigger_executor import execute_template_tools
-from app.services.workflow_engine import prepare_template_actions
+from app.services.workflow_engine import emit_trigger, prepare_template_actions
 
 logger = logging.getLogger(__name__)
 
@@ -116,3 +116,27 @@ async def process_transcription(
             )
         except Exception:
             logger.exception("Falha ao executar as ferramentas de integração da nota")
+    # O trigger de fluxo "nota pronta" também é best-effort: a nota já foi
+    # persistida e processada, então uma falha de fluxo NUNCA pode desfazê-la.
+    if note.status == NoteStatus.PROCESSED:
+        try:
+            trigger_user = await session.get(User, note.user_id)
+            if trigger_user is not None and trigger_user.workspace_id is not None:
+                context = {"event_type": "DOCUMENT_GENERATED"}
+                # Filtro "nota do modelo X": o id do modelo vai no context["source"],
+                # que é o que _condition_matches compara. O source_id continua sendo
+                # a nota (chave de idempotência da execução).
+                if note.template_id is not None:
+                    context["source"] = str(note.template_id)
+                created = await emit_trigger(
+                    session,
+                    trigger_user.workspace_id,
+                    note.user_id,
+                    "DOCUMENT_GENERATED",
+                    source_id=note.id,
+                    context=context,
+                )
+                if created:
+                    await session.commit()
+        except Exception:
+            logger.exception("Falha ao emitir o trigger de fluxo da nota %s", note.id)
